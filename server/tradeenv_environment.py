@@ -82,8 +82,8 @@ class TradeEnvEnvironment(Environment):
         self._reset_count = 0
         self._task_idx = -1
         self._task: TaskSpec = TASKS[0]
-        self._market = self._download_market_data(NIFTY50_SYMBOLS)
-        self._episodes = self._build_episode_table(self._market)
+        self._market: pd.DataFrame | None = None  # Lazy-load on first reset
+        self._episodes: pd.DataFrame | None = None  # Lazy-load on first reset
 
         self._price_path: List[float] = []
         self._step_idx = 0
@@ -113,6 +113,11 @@ class TradeEnvEnvironment(Environment):
         self._reset_count += 1
         self._task_idx = (self._task_idx + 1) % len(TASKS)
         self._task = TASKS[self._task_idx]
+
+        # Lazy-load market data on first reset to avoid blocking app startup
+        if self._market is None:
+            self._market = self._download_market_data(NIFTY50_SYMBOLS)
+            self._episodes = self._build_episode_table(self._market)
 
         task_rows = self._episodes[self._episodes["symbol"].isin(self._task.symbols)].reset_index(drop=True)
         ep_idx = (self._reset_count // len(TASKS)) % len(task_rows)
@@ -322,6 +327,14 @@ class TradeEnvEnvironment(Environment):
 
     @staticmethod
     def _download_market_data(symbols: List[str]) -> pd.DataFrame:
+        # First, try to load pre-downloaded data from CSV
+        import pathlib
+        csv_path = pathlib.Path(__file__).parent.parent / "data" / "nifty50_market_data.csv"
+        if csv_path.exists():
+            print(f"Loading market data from {csv_path}")
+            return pd.read_csv(csv_path)
+
+        # If no CSV, try to download from yfinance
         raw = yf.download(
             tickers=symbols,
             period="5mo",
@@ -353,7 +366,11 @@ class TradeEnvEnvironment(Environment):
             rows.append(sdf)
 
         if not rows:
-            raise RuntimeError("No market data downloaded from yfinance for provided NIFTY symbols.")
+            raise RuntimeError(
+                "No market data downloaded from yfinance for provided NIFTY symbols. "
+                "Run the data download script in notebooks/hackathon_project.ipynb "
+                "to fetch and save NIFTY50 price data, then commit it to the repo."
+            )
 
         df = pd.concat(rows).reset_index().rename(columns={"Date": "date", "index": "date"})
         if "date" not in df.columns:
