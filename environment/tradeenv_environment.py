@@ -14,13 +14,13 @@ from openenv.core.env_server.types import State
 
 try:
     from ..models import (
-        BulktradeAction,
-        BulktradeObservation,
-        BulktradeReward,
-        BulktradeTaskScore,
+        TradeEnvAction,
+        TradeEnvObservation,
+        TradeEnvReward,
+        TradeEnvTaskScore,
     )
 except ImportError:
-    from models import BulktradeAction, BulktradeObservation, BulktradeReward, BulktradeTaskScore
+    from models import TradeEnvAction, TradeEnvObservation, TradeEnvReward, TradeEnvTaskScore
 
 
 NIFTY50_SYMBOLS: List[str] = [
@@ -72,7 +72,7 @@ TASKS: List[TaskSpec] = [
 ]
 
 
-class BulktradeEnvironment(Environment):
+class TradeEnvEnvironment(Environment):
     """Real-world bulk execution simulator with deterministic graders."""
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -93,7 +93,7 @@ class BulktradeEnvironment(Environment):
         self._trades_used = 0
         self._fills: List[Tuple[int, float]] = []
         self._last_reward = 0.0
-        self._last_score = BulktradeTaskScore(
+        self._last_score = TradeEnvTaskScore(
             task_name="",
             difficulty="easy",
             score=0.0,
@@ -108,7 +108,7 @@ class BulktradeEnvironment(Environment):
         self._symbol = ""
         self._date = ""
 
-    def reset(self) -> BulktradeObservation:
+    def reset(self) -> TradeEnvObservation:
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._reset_count += 1
         self._task_idx = (self._task_idx + 1) % len(TASKS)
@@ -142,7 +142,7 @@ class BulktradeEnvironment(Environment):
         self._trades_used = 0
         self._fills = []
         self._last_reward = 0.0
-        self._last_score = BulktradeTaskScore(
+        self._last_score = TradeEnvTaskScore(
             task_name=self._task.name,
             difficulty=self._task.difficulty,
             score=0.0,
@@ -151,11 +151,11 @@ class BulktradeEnvironment(Environment):
 
         return self._build_observation(done=False, reward=0.0, info={"phase": "reset", "date": self._date})
 
-    def step(self, action: BulktradeAction) -> BulktradeObservation:  # type: ignore[override]
+    def step(self, action: TradeEnvAction) -> TradeEnvObservation:  # type: ignore[override]
         observation, reward, done, info = self.step_transition(action)
         return self._build_observation(done=done, reward=reward, info=info)
 
-    def step_transition(self, action: BulktradeAction) -> Tuple[BulktradeObservation, float, bool, Dict]:
+    def step_transition(self, action: TradeEnvAction) -> Tuple[TradeEnvObservation, float, bool, Dict]:
         self._state.step_count += 1
         self._step_idx = min(self._step_idx + 1, len(self._price_path) - 1)
         current_price = float(self._price_path[self._step_idx])
@@ -218,7 +218,7 @@ class BulktradeEnvironment(Environment):
             self._last_score = self._grade_current_task()
             terminal_adjustment += (self._last_score.score - 0.5) * 0.2
 
-        reward_obj = BulktradeReward(
+        reward_obj = TradeEnvReward(
             immediate_edge=immediate_edge,
             progress_bonus=progress_bonus,
             constraint_penalty=constraint_penalty,
@@ -239,9 +239,9 @@ class BulktradeEnvironment(Environment):
         obs = self._build_observation(done=done, reward=reward_obj.total, info=info)
         return obs, reward_obj.total, done, info
 
-    def _build_observation(self, done: bool, reward: float, info: Dict) -> BulktradeObservation:
+    def _build_observation(self, done: bool, reward: float, info: Dict) -> TradeEnvObservation:
         avg_px = self._cum_notional / self._executed_qty if self._executed_qty > 0 else 0.0
-        return BulktradeObservation(
+        return TradeEnvObservation(
             task_name=self._task.name,
             difficulty=self._task.difficulty,
             symbol=self._symbol,
@@ -267,9 +267,9 @@ class BulktradeEnvironment(Environment):
             },
         )
 
-    def _grade_current_task(self) -> BulktradeTaskScore:
+    def _grade_current_task(self) -> TradeEnvTaskScore:
         if self._executed_qty <= 0:
-            return BulktradeTaskScore(
+            return TradeEnvTaskScore(
                 task_name=self._task.name,
                 difficulty=self._task.difficulty,
                 score=0.0,
@@ -295,7 +295,7 @@ class BulktradeEnvironment(Environment):
         else:
             score = 0.65 * quality + 0.20 * fill_ratio + 0.15 * efficiency
 
-        return BulktradeTaskScore(
+        return TradeEnvTaskScore(
             task_name=self._task.name,
             difficulty=self._task.difficulty,
             score=float(np.clip(score, 0.0, 1.0)),
@@ -388,11 +388,11 @@ class BulktradeEnvironment(Environment):
 
 
 if __name__ == "__main__":
-    env = BulktradeEnvironment()
+    env = TradeEnvEnvironment()
     obs = env.reset()
     print("Reset:", obs.task_name, obs.symbol, obs.current_price)
     for _ in range(5):
-        step_obs = env.step(BulktradeAction(action_type=obs.target_side, quantity=100))
+        step_obs = env.step(TradeEnvAction(action_type=obs.target_side, quantity=100))
         print("Step", step_obs.step_index, "reward", step_obs.reward, "remaining", step_obs.remaining_quantity)
         if step_obs.done:
             break

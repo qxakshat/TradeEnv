@@ -9,9 +9,9 @@ requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openenv-bulkTrade"
+name = "openenv-tradeenv"
 version = "0.1.0"
-description = "Bulktrade environment for OpenEnv"
+description = "TradeEnv environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
     "openenv-core[core]>=0.2.1",
@@ -29,10 +29,10 @@ dev = [
 
 [project.scripts]
 # Server entry point - enables running via: uv run --project . server
-# or: python -m bulkTrade.server.app
-server = "bulkTrade.server.app:main"
+# or: python -m tradeenv.server.app
+server = "tradeenv.server.app:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["bulkTrade", "bulkTrade.server"]
-package-dir = { "bulkTrade" = ".", "bulkTrade.server" = "server" }
+packages = ["tradeenv", "tradeenv.server"]
+package-dir = { "tradeenv" = ".", "tradeenv.server" = "server" }

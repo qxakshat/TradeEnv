@@ -5,9 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-FastAPI application for the Bulktrade Environment.
+FastAPI application for the TradeEnv Environment.
 
-This module creates an HTTP server that exposes the BulktradeEnvironment
+This module creates an HTTP server that exposes the TradeEnvEnvironment
 over HTTP and WebSocket endpoints, compatible with EnvClient.
 
 Endpoints:
@@ -36,19 +36,19 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from ..models import BulktradeAction, BulktradeObservation
-    from .bulkTrade_environment import BulktradeEnvironment
+    from ..models import TradeEnvAction, TradeEnvObservation
+    from .tradeenv_environment import TradeEnvEnvironment
 except ModuleNotFoundError:
-    from models import BulktradeAction, BulktradeObservation
-    from server.bulkTrade_environment import BulktradeEnvironment
+    from models import TradeEnvAction, TradeEnvObservation
+    from environment.tradeenv_environment import TradeEnvEnvironment
 
 
 # Create the app with web interface and README integration
 app = create_app(
-    BulktradeEnvironment,
-    BulktradeAction,
-    BulktradeObservation,
-    env_name="bulkTrade",
+    TradeEnvEnvironment,
+    TradeEnvAction,
+    TradeEnvObservation,
+    env_name="TradeEnv",
     max_concurrent_envs=4,
 )
 

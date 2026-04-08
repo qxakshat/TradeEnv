@@ -1,4 +1,4 @@
-"""Baseline inference script for bulkTrade OpenEnv benchmark.
+"""Baseline inference script for TradeEnv OpenEnv benchmark.
 
 Runs three deterministic tasks (easy/medium/hard) and prints reproducible
 [START]/[STEP]/[END] logs for each episode.
@@ -12,14 +12,14 @@ from typing import Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
-from client import BulktradeEnv
-from models import BulktradeAction
+from client import TradeEnvClient
+from models import TradeEnvAction
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-IMAGE_NAME = os.getenv("IMAGE_NAME", "bulktrade-env:latest")
-BENCHMARK = "bulkTrade"
+IMAGE_NAME = os.getenv("IMAGE_NAME", "tradeenv:latest")
+BENCHMARK = "TradeEnv"
 MAX_STEPS = 16
 
 SYSTEM_PROMPT = textwrap.dedent(
@@ -106,7 +106,7 @@ def choose_action_with_model(client: OpenAI, obs) -> Tuple[str, int, str]:
         return obs.target_side, fallback_qty, f"fallback:{exc}"
 
 
-def run_episode(env: BulktradeEnv, client: OpenAI) -> Dict:
+def run_episode(env: TradeEnvClient, client: OpenAI) -> Dict:
     result = env.reset()
     obs = result.observation
     task_name = obs.task_name
@@ -122,7 +122,7 @@ def run_episode(env: BulktradeEnv, client: OpenAI) -> Dict:
         action_type, quantity, action_src = choose_action_with_model(client, obs)
         action_txt = f"{action_type}:{quantity}"
 
-        result = env.step(BulktradeAction(action_type=action_type, quantity=quantity))
+        result = env.step(TradeEnvAction(action_type=action_type, quantity=quantity))
         obs = result.observation
         reward = float(result.reward or 0.0)
 
@@ -152,7 +152,7 @@ def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=OPENAI_API_KEY)
 
     # reset() cycles deterministic tasks: easy -> medium -> hard
-    env = BulktradeEnv.from_docker_image(IMAGE_NAME)
+    env = TradeEnvClient.from_docker_image(IMAGE_NAME)
 
     all_results = []
     try:

@@ -1,5 +1,5 @@
 ---
-title: BulkTrade OpenEnv Environment
+title: TradeEnv OpenEnv Environment
 emoji: 📈
 colorFrom: blue
 colorTo: green
@@ -11,9 +11,9 @@ tags:
   - openenv
 ---
 
-# BulkTrade: Institutional-Style Execution Environment
+# TradeEnv: Institutional-Style Execution Environment
 
-`bulkTrade` simulates a real execution desk task: buy/sell a large order over one trading day while minimizing market impact and maximizing fill quality.
+`TradeEnv` simulates a real execution desk task: buy/sell a large order over one trading day while minimizing market impact and maximizing fill quality.
 
 This is a **real-world utility** benchmark for agentic decision-making in finance execution workflows.
 
@@ -30,9 +30,9 @@ Human traders split large orders over time while reacting to market signals (pri
 
 The environment implements typed Pydantic models and OpenEnv primitives:
 
-- `BulktradeAction` (typed action)
-- `BulktradeObservation` (typed observation)
-- `BulktradeReward` (typed reward decomposition)
+- `TradeEnvAction` (typed action)
+- `TradeEnvObservation` (typed observation)
+- `TradeEnvReward` (typed reward decomposition)
 - `step(action)` returns transition semantics `(observation, reward, done, info)` internally, and returns `Observation` object with OpenEnv-compatible `reward/done/metadata` fields
 - `reset()` returns initial observation
 - `state` endpoint provides current environment state (`episode_id`, `step_count`)
@@ -45,12 +45,12 @@ Validation:
 
 ## Observation and Action Space
 
-### Action (`BulktradeAction`)
+### Action (`TradeEnvAction`)
 
 - `action_type`: `buy | sell | hold`
 - `quantity`: integer shares for current step
 
-### Observation (`BulktradeObservation`)
+### Observation (`TradeEnvObservation`)
 
 Includes:
 
@@ -134,8 +134,8 @@ openenv validate
 ## Build & run container
 
 ```bash
-docker build -t bulktrade-env:latest -f server/Dockerfile .
-docker run --rm -p 8000:8000 bulktrade-env:latest
+docker build -t tradeenv:latest -f server/Dockerfile .
+docker run --rm -p 8000:8000 tradeenv:latest
 ```
 
 ## Hugging Face Space deployment
@@ -156,7 +156,7 @@ python inference.py
 ## Project structure
 
 - `models.py`: typed Action/Observation/Reward models
-- `server/bulkTrade_environment.py`: environment, reward shaping, tasks, graders
+- `server/tradeenv_environment.py`: environment, reward shaping, tasks, graders
 - `client.py`: typed OpenEnv client
 - `inference.py`: OpenAI baseline over 3 tasks
 - `openenv.yaml`: environment manifest

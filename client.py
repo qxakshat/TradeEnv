@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Bulktrade Environment Client."""
+"""TradeEnv Environment Client."""
 
 from typing import Dict
 
@@ -12,14 +12,14 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import BulktradeAction, BulktradeObservation
+from .models import TradeEnvAction, TradeEnvObservation
 
 
-class BulktradeEnv(
-    EnvClient[BulktradeAction, BulktradeObservation, State]
+class TradeEnvClient(
+    EnvClient[TradeEnvAction, TradeEnvObservation, State]
 ):
     """
-    Client for the Bulktrade Environment.
+    Client for the TradeEnv Environment.
 
     This client maintains a persistent WebSocket connection to the environment server,
     enabling efficient multi-step interactions with lower latency.
@@ -27,29 +27,29 @@ class BulktradeEnv(
 
     Example:
         >>> # Connect to a running server
-        >>> with BulktradeEnv(base_url="http://localhost:8000") as client:
+        >>> with TradeEnvClient(base_url="http://localhost:8000") as client:
         ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
+        ...     print(result.observation.task_name)
         ...
-        ...     result = client.step(BulktradeAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        ...     result = client.step(TradeEnvAction(action_type="buy", quantity=100))
+        ...     print(result.observation.remaining_quantity)
 
     Example with Docker:
         >>> # Automatically start container and connect
-        >>> client = BulktradeEnv.from_docker_image("bulkTrade-env:latest")
+        >>> client = TradeEnvClient.from_docker_image("tradeenv:latest")
         >>> try:
         ...     result = client.reset()
-        ...     result = client.step(BulktradeAction(message="Test"))
+        ...     result = client.step(TradeEnvAction(action_type="buy", quantity=100))
         ... finally:
         ...     client.close()
     """
 
-    def _step_payload(self, action: BulktradeAction) -> Dict:
+    def _step_payload(self, action: TradeEnvAction) -> Dict:
         """
-        Convert BulktradeAction to JSON payload for step message.
+        Convert TradeEnvAction to JSON payload for step message.
 
         Args:
-            action: BulktradeAction instance
+            action: TradeEnvAction instance
 
         Returns:
             Dictionary representation suitable for JSON encoding
@@ -59,18 +59,18 @@ class BulktradeEnv(
             "quantity": action.quantity,
         }
 
-    def _parse_result(self, payload: Dict) -> StepResult[BulktradeObservation]:
+    def _parse_result(self, payload: Dict) -> StepResult[TradeEnvObservation]:
         """
-        Parse server response into StepResult[BulktradeObservation].
+        Parse server response into StepResult[TradeEnvObservation].
 
         Args:
             payload: JSON response data from server
 
         Returns:
-            StepResult with BulktradeObservation
+            StepResult with TradeEnvObservation
         """
         obs_data = payload.get("observation", {})
-        observation = BulktradeObservation(
+        observation = TradeEnvObservation(
             task_name=obs_data.get("task_name", ""),
             difficulty=obs_data.get("difficulty", "easy"),
             symbol=obs_data.get("symbol", ""),

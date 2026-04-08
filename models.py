@@ -12,7 +12,7 @@ from openenv.core.env_server.types import Action, Observation
 from pydantic import BaseModel, Field
 
 
-class BulktradeAction(Action):
+class TradeEnvAction(Action):
     """Agent action for bulk execution."""
 
     action_type: Literal["buy", "sell", "hold"] = Field(
@@ -27,7 +27,7 @@ class BulktradeAction(Action):
     )
 
 
-class BulktradeReward(BaseModel):
+class TradeEnvReward(BaseModel):
     """Dense reward decomposition for trajectory-level learning signal."""
 
     immediate_edge: float = Field(description="Price edge versus running VWAP benchmark")
@@ -37,7 +37,7 @@ class BulktradeReward(BaseModel):
     total: float = Field(description="Final scalar reward used by the environment")
 
 
-class BulktradeTaskScore(BaseModel):
+class TradeEnvTaskScore(BaseModel):
     """Deterministic task score in [0, 1]."""
 
     task_name: str
@@ -46,7 +46,7 @@ class BulktradeTaskScore(BaseModel):
     rationale: str
 
 
-class BulktradeObservation(Observation):
+class TradeEnvObservation(Observation):
     """Observation for the current execution state."""
 
     task_name: str = Field(description="Current task identifier")
