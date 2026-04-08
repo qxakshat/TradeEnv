@@ -18,15 +18,37 @@ try:
         TradeEnvObservation,
         TradeEnvReward,
         TradeEnvTaskScore,
+        TradingRole,
     )
+    from .broker_adapters import get_supported_brokers
 except ImportError:
-    from models import TradeEnvAction, TradeEnvObservation, TradeEnvReward, TradeEnvTaskScore
+    from models import TradeEnvAction, TradeEnvObservation, TradeEnvReward, TradeEnvTaskScore, TradingRole
+    from server.broker_adapters import get_supported_brokers
 
 
 NIFTY50_SYMBOLS: List[str] = [
     "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "ITC.NS",
     "LT.NS", "KOTAKBANK.NS", "HINDUNILVR.NS", "AXISBANK.NS", "ASIANPAINT.NS", "BAJFINANCE.NS",
     "MARUTI.NS", "SUNPHARMA.NS", "TITAN.NS", "ULTRACEMCO.NS", "WIPRO.NS", "NTPC.NS", "POWERGRID.NS",
+]
+
+
+@dataclass(frozen=True)
+class RoleSpec:
+    role: TradingRole
+    description: str
+    slippage_factor: float
+    speed_bonus_weight: float
+    quality_weight: float
+    consistency_reward: float
+
+
+ROLES: List[RoleSpec] = [
+    RoleSpec("aggressive_buyer", "Fast completion-focused buyer", 1.30, 0.35, 0.35, 0.00),
+    RoleSpec("conservative_seller", "Patient high-quality seller", 0.70, 0.05, 0.55, 0.08),
+    RoleSpec("market_maker", "Balanced execution and inventory control", 0.90, 0.15, 0.40, 0.12),
+    RoleSpec("arbitrageur", "Mispricing hunter with tight spread discipline", 0.55, 0.00, 0.70, 0.08),
+    RoleSpec("volatility_trader", "Executes around volatility shocks", 0.85, 0.20, 0.50, 0.10),
 ]
 
 
@@ -55,25 +77,25 @@ TASKS: List[TaskSpec] = [
         name="medium_sell_quality",
         difficulty="medium",
         side="sell",
-        target_quantity=1_000,
+        target_quantity=1_100,
         max_trades=8,
         symbols=["INFY.NS", "ICICIBANK.NS", "LT.NS", "SBIN.NS"],
-        description="Sell inventory close to intraday highs with limited actions.",
+        description="Sell inventory near intraday highs while respecting action budget.",
     ),
     TaskSpec(
-        name="hard_volatile_execution",
+        name="hard_depth_aware_execution",
         difficulty="hard",
         side="buy",
-        target_quantity=1_200,
+        target_quantity=1_250,
         max_trades=6,
         symbols=["BAJFINANCE.NS", "MARUTI.NS", "WIPRO.NS", "TITAN.NS"],
-        description="Buy on volatile names with strict trade budget and minimal slippage.",
+        description="Buy volatile names under thin depth and wider spreads with low slippage.",
     ),
 ]
 
 
 class TradeEnvEnvironment(Environment):
-    """Real-world bulk execution simulator with deterministic graders."""
+    """Depth-aware bulk execution simulator with deterministic graders."""
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
@@ -81,11 +103,14 @@ class TradeEnvEnvironment(Environment):
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._reset_count = 0
         self._task_idx = -1
+        self._role_idx = -1
         self._task: TaskSpec = TASKS[0]
-        self._market: pd.DataFrame | None = None  # Lazy-load on first reset
-        self._episodes: pd.DataFrame | None = None  # Lazy-load on first reset
+        self._role: RoleSpec = ROLES[0]
+        self._market: pd.DataFrame | None = None
+        self._episodes: pd.DataFrame | None = None
 
         self._price_path: List[float] = []
+        self._book_path: List[Dict[str, float]] = []
         self._step_idx = 0
         self._executed_qty = 0
         self._remaining_qty = 0
@@ -93,10 +118,17 @@ class TradeEnvEnvironment(Environment):
         self._trades_used = 0
         self._fills: List[Tuple[int, float]] = []
         self._last_reward = 0.0
+        self._last_slippage_bps = 0.0
         self._last_score = TradeEnvTaskScore(
             task_name="",
             difficulty="easy",
+            role="aggressive_buyer",
             score=0.0,
+            role_metric=0.0,
+            quality_metric=0.0,
+            fill_metric=0.0,
+            slippage_metric=0.0,
+            efficiency_metric=0.0,
             rationale="not_started",
         )
         self._day_low = 0.0
@@ -112,13 +144,15 @@ class TradeEnvEnvironment(Environment):
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._reset_count += 1
         self._task_idx = (self._task_idx + 1) % len(TASKS)
+        self._role_idx = (self._reset_count - 1) % len(ROLES)
         self._task = TASKS[self._task_idx]
+        self._role = ROLES[self._role_idx]
 
-        # Lazy-load market data on first reset to avoid blocking app startup
         if self._market is None:
             self._market = self._download_market_data(NIFTY50_SYMBOLS)
             self._episodes = self._build_episode_table(self._market)
 
+        assert self._episodes is not None
         task_rows = self._episodes[self._episodes["symbol"].isin(self._task.symbols)].reset_index(drop=True)
         ep_idx = (self._reset_count // len(TASKS)) % len(task_rows)
         row = task_rows.iloc[ep_idx]
@@ -139,6 +173,12 @@ class TradeEnvEnvironment(Environment):
             close_price=float(row["close"]),
             n_steps=12,
         )
+        self._book_path = self._simulate_market_depth(
+            symbol=self._symbol,
+            date=self._date,
+            prices=self._price_path,
+            difficulty=self._task.difficulty,
+        )
 
         self._step_idx = 0
         self._executed_qty = 0
@@ -147,30 +187,43 @@ class TradeEnvEnvironment(Environment):
         self._trades_used = 0
         self._fills = []
         self._last_reward = 0.0
+        self._last_slippage_bps = 0.0
         self._last_score = TradeEnvTaskScore(
             task_name=self._task.name,
             difficulty=self._task.difficulty,
+            role=self._role.role,
             score=0.0,
+            role_metric=0.0,
+            quality_metric=0.0,
+            fill_metric=0.0,
+            slippage_metric=0.0,
+            efficiency_metric=0.0,
             rationale="in_progress",
         )
 
         return self._build_observation(done=False, reward=0.0, info={"phase": "reset", "date": self._date})
 
     def step(self, action: TradeEnvAction) -> TradeEnvObservation:  # type: ignore[override]
-        observation, reward, done, info = self.step_transition(action)
+        _, reward, done, info = self.step_transition(action)
         return self._build_observation(done=done, reward=reward, info=info)
 
     def step_transition(self, action: TradeEnvAction) -> Tuple[TradeEnvObservation, float, bool, Dict]:
         self._state.step_count += 1
         self._step_idx = min(self._step_idx + 1, len(self._price_path) - 1)
         current_price = float(self._price_path[self._step_idx])
+        book = self._book_path[self._step_idx]
 
         immediate_edge = 0.0
         progress_bonus = 0.0
+        slippage_penalty = 0.0
+        trade_efficiency_bonus = 0.0
+        depth_timing_bonus = 0.0
         constraint_penalty = 0.0
         terminal_adjustment = 0.0
+        role_adjustment = 0.0
 
         requested_qty = int(max(action.quantity, 0))
+        urgency = float(np.clip(action.urgency, 0.0, 1.0))
 
         if self._trades_used >= self._task.max_trades and action.action_type in {"buy", "sell"} and requested_qty > 0:
             constraint_penalty -= 0.20
@@ -193,7 +246,14 @@ class TradeEnvEnvironment(Environment):
             else:
                 self._trades_used += 1
                 participation = executed_qty / max(self._task.target_quantity, 1)
-                slippage = 0.001 + 0.01 * participation
+                available_depth = max(book["bid_depth_top"] if self._task.side == "sell" else book["ask_depth_top"], 1.0)
+                depth_pressure = min(executed_qty / available_depth, 3.0)
+
+                base_slippage = 0.0008 + 0.0075 * participation + 0.0015 * depth_pressure
+                urgency_slippage = 0.0025 * urgency
+                slippage = (base_slippage + urgency_slippage) * self._role.slippage_factor
+                self._last_slippage_bps = slippage * 10_000
+
                 if self._task.side == "buy":
                     fill_price = current_price * (1.0 + slippage)
                     immediate_edge = (self._day_vwap - fill_price) / max(self._day_vwap, 1e-6)
@@ -202,6 +262,19 @@ class TradeEnvEnvironment(Environment):
                     immediate_edge = (fill_price - self._day_vwap) / max(self._day_vwap, 1e-6)
 
                 progress_bonus = 0.08 * participation
+                if self._role.speed_bonus_weight > 0:
+                    time_progress = self._step_idx / max(len(self._price_path) - 1, 1)
+                    progress_bonus += self._role.speed_bonus_weight * 0.05 * (1.0 - time_progress)
+
+                spread_pen = min(book["spread_bps"] / 45.0, 1.0)
+                slip_pen = min(self._last_slippage_bps / 120.0, 1.0)
+                slippage_penalty = -0.08 * (0.6 * spread_pen + 0.4 * slip_pen)
+
+                depth_favorability = 0.5 * (book["depth_imbalance"] + 1.0)
+                if self._task.side == "sell":
+                    depth_favorability = 1.0 - depth_favorability
+                depth_timing_bonus = 0.05 * (depth_favorability - 0.5)
+
                 self._executed_qty += executed_qty
                 self._remaining_qty -= executed_qty
                 self._cum_notional += executed_qty * fill_price
@@ -217,42 +290,68 @@ class TradeEnvEnvironment(Environment):
             self._cum_notional += forced_qty * forced_price
             self._fills.append((forced_qty, forced_price))
             self._remaining_qty = 0
-            terminal_adjustment -= 0.20
+            terminal_adjustment -= 0.22
 
         if done:
             self._last_score = self._grade_current_task()
-            terminal_adjustment += (self._last_score.score - 0.5) * 0.2
+            terminal_adjustment += (self._last_score.score - 0.5) * 0.22
+            trade_efficiency_bonus = 0.10 * self._last_score.efficiency_metric
+            role_adjustment = self._role.consistency_reward * self._last_score.role_metric
 
         reward_obj = TradeEnvReward(
             immediate_edge=immediate_edge,
             progress_bonus=progress_bonus,
+            slippage_penalty=slippage_penalty,
+            trade_efficiency_bonus=trade_efficiency_bonus,
+            depth_timing_bonus=depth_timing_bonus,
             constraint_penalty=constraint_penalty,
             terminal_adjustment=terminal_adjustment,
-            total=immediate_edge + progress_bonus + constraint_penalty + terminal_adjustment,
+            role_adjustment=role_adjustment,
+            total=(
+                immediate_edge
+                + progress_bonus
+                + slippage_penalty
+                + trade_efficiency_bonus
+                + depth_timing_bonus
+                + constraint_penalty
+                + terminal_adjustment
+                + role_adjustment
+            ),
         )
         self._last_reward = reward_obj.total
 
         info = {
             "task": self._task.name,
+            "role": self._role.role,
             "date": self._date,
             "symbol": self._symbol,
             "invalid_reason": invalid_reason,
             "reward_breakdown": reward_obj.model_dump(),
             "task_score": self._last_score.model_dump() if done else None,
+            "broker_integration": get_supported_brokers(),
         }
 
         obs = self._build_observation(done=done, reward=reward_obj.total, info=info)
         return obs, reward_obj.total, done, info
 
     def _build_observation(self, done: bool, reward: float, info: Dict) -> TradeEnvObservation:
+        book = self._book_path[self._step_idx]
         avg_px = self._cum_notional / self._executed_qty if self._executed_qty > 0 else 0.0
         return TradeEnvObservation(
             task_name=self._task.name,
             difficulty=self._task.difficulty,
+            role=self._role.role,
             symbol=self._symbol,
             step_index=self._step_idx,
             max_steps=len(self._price_path),
             current_price=float(self._price_path[self._step_idx]),
+            best_bid=float(book["best_bid"]),
+            best_ask=float(book["best_ask"]),
+            spread_bps=float(book["spread_bps"]),
+            bid_depth_top=float(book["bid_depth_top"]),
+            ask_depth_top=float(book["ask_depth_top"]),
+            depth_imbalance=float(book["depth_imbalance"]),
+            estimated_slippage_bps=float(self._last_slippage_bps),
             ema_fast=self._ema_fast,
             ema_slow=self._ema_slow,
             rsi_14=self._rsi,
@@ -267,8 +366,14 @@ class TradeEnvEnvironment(Environment):
             reward=reward,
             metadata={
                 "task_description": self._task.description,
+                "role_description": self._role.description,
                 "date": self._date,
                 "info": info,
+                "ui": {
+                    "primary_metric": "task_score",
+                    "secondary_metric": "estimated_slippage_bps",
+                    "charts": ["reward_breakdown", "depth_imbalance", "spread_bps"],
+                },
             },
         )
 
@@ -277,7 +382,13 @@ class TradeEnvEnvironment(Environment):
             return TradeEnvTaskScore(
                 task_name=self._task.name,
                 difficulty=self._task.difficulty,
+                role=self._role.role,
                 score=0.0,
+                role_metric=0.0,
+                quality_metric=0.0,
+                fill_metric=0.0,
+                slippage_metric=0.0,
+                efficiency_metric=0.0,
                 rationale="no_execution",
             )
 
@@ -291,20 +402,47 @@ class TradeEnvEnvironment(Environment):
             quality = (avg_price - self._day_low) / spread
 
         quality = float(np.clip(quality, 0.0, 1.0))
-        efficiency = float(np.clip(1.0 - (self._trades_used / max(self._task.max_trades, 1)), 0.0, 1.0))
+
+        trades_util = self._trades_used / max(self._task.max_trades, 1)
+        efficiency = float(np.clip(1.0 - trades_util, 0.0, 1.0))
+
+        realized_slippage_bps = abs(avg_price - self._day_vwap) / max(self._day_vwap, 1e-6) * 10_000
+        slippage_metric = float(np.clip(1.0 - (realized_slippage_bps / 220.0), 0.0, 1.0))
 
         if self._task.difficulty == "easy":
-            score = quality
+            score = 0.70 * quality + 0.20 * fill_ratio + 0.10 * slippage_metric
         elif self._task.difficulty == "medium":
-            score = 0.80 * quality + 0.20 * fill_ratio
+            score = 0.55 * quality + 0.25 * fill_ratio + 0.15 * slippage_metric + 0.05 * efficiency
         else:
-            score = 0.65 * quality + 0.20 * fill_ratio + 0.15 * efficiency
+            score = 0.35 * quality + 0.25 * fill_ratio + 0.25 * slippage_metric + 0.15 * efficiency
+
+        if self._role.role == "aggressive_buyer":
+            role_metric = 0.45 * quality + 0.35 * fill_ratio + 0.20 * efficiency
+        elif self._role.role == "conservative_seller":
+            role_metric = 0.55 * quality + 0.30 * slippage_metric + 0.15 * efficiency
+        elif self._role.role == "market_maker":
+            balance = float(np.clip(1.0 - abs(fill_ratio - 1.0), 0.0, 1.0))
+            role_metric = 0.40 * quality + 0.30 * balance + 0.30 * slippage_metric
+        elif self._role.role == "arbitrageur":
+            role_metric = 0.20 * quality + 0.70 * slippage_metric + 0.10 * efficiency
+        else:
+            time_score = float(np.clip(self._step_idx / max(len(self._price_path) - 1, 1), 0.0, 1.0))
+            role_metric = 0.45 * quality + 0.20 * fill_ratio + 0.15 * efficiency + 0.20 * (1.0 - time_score)
 
         return TradeEnvTaskScore(
             task_name=self._task.name,
             difficulty=self._task.difficulty,
+            role=self._role.role,
             score=float(np.clip(score, 0.0, 1.0)),
-            rationale=f"quality={quality:.3f}, fill={fill_ratio:.3f}, efficiency={efficiency:.3f}",
+            role_metric=float(np.clip(role_metric, 0.0, 1.0)),
+            quality_metric=quality,
+            fill_metric=float(fill_ratio),
+            slippage_metric=slippage_metric,
+            efficiency_metric=efficiency,
+            rationale=(
+                f"quality={quality:.3f}, fill={fill_ratio:.3f}, "
+                f"slippage={slippage_metric:.3f}, efficiency={efficiency:.3f}, role_metric={role_metric:.3f}"
+            ),
         )
 
     @property
@@ -326,15 +464,62 @@ class TradeEnvEnvironment(Environment):
         return [float(x) for x in path]
 
     @staticmethod
+    def _stable_key(symbol: str, date: str, step_idx: int) -> int:
+        text = f"{symbol}|{date}|{step_idx}"
+        return int(sum((i + 1) * ord(ch) for i, ch in enumerate(text)))
+
+    @classmethod
+    def _simulate_market_depth(
+        cls,
+        symbol: str,
+        date: str,
+        prices: List[float],
+        difficulty: Literal["easy", "medium", "hard"],
+    ) -> List[Dict[str, float]]:
+        if difficulty == "easy":
+            liq_mult, spread_base = 1.2, 8.0
+        elif difficulty == "medium":
+            liq_mult, spread_base = 1.0, 14.0
+        else:
+            liq_mult, spread_base = 0.7, 22.0
+
+        books: List[Dict[str, float]] = []
+        for i, px in enumerate(prices):
+            k = cls._stable_key(symbol, date, i)
+            cyc = np.sin(0.73 * i + (k % 17) * 0.1)
+            cyc2 = np.cos(0.41 * i + (k % 13) * 0.07)
+
+            spread_bps = max(3.5, spread_base + 3.2 * cyc + 2.1 * cyc2)
+            half_spread = (spread_bps / 10_000.0) * px * 0.5
+            best_bid = px - half_spread
+            best_ask = px + half_spread
+
+            base_depth = 900.0 * liq_mult
+            bid_depth = max(80.0, base_depth * (1.0 + 0.30 * cyc))
+            ask_depth = max(80.0, base_depth * (1.0 - 0.25 * cyc2))
+            imbalance = float(np.clip((bid_depth - ask_depth) / max(bid_depth + ask_depth, 1.0), -1.0, 1.0))
+
+            books.append(
+                {
+                    "best_bid": float(best_bid),
+                    "best_ask": float(best_ask),
+                    "spread_bps": float(spread_bps),
+                    "bid_depth_top": float(bid_depth),
+                    "ask_depth_top": float(ask_depth),
+                    "depth_imbalance": imbalance,
+                }
+            )
+        return books
+
+    @staticmethod
     def _download_market_data(symbols: List[str]) -> pd.DataFrame:
-        # First, try to load pre-downloaded data from CSV
         import pathlib
+
         csv_path = pathlib.Path(__file__).parent.parent / "data" / "nifty50_market_data.csv"
         if csv_path.exists():
             print(f"Loading market data from {csv_path}")
             return pd.read_csv(csv_path)
 
-        # If no CSV, try to download from yfinance
         raw = yf.download(
             tickers=symbols,
             period="5mo",
@@ -397,7 +582,6 @@ class TradeEnvEnvironment(Environment):
 
     @staticmethod
     def _build_episode_table(df: pd.DataFrame) -> pd.DataFrame:
-        # Ensure enough history for indicators and deterministic grading.
         out = df.copy()
         out["row_num"] = out.groupby("symbol").cumcount()
         out = out[out["row_num"] >= 14].reset_index(drop=True)
@@ -407,9 +591,9 @@ class TradeEnvEnvironment(Environment):
 if __name__ == "__main__":
     env = TradeEnvEnvironment()
     obs = env.reset()
-    print("Reset:", obs.task_name, obs.symbol, obs.current_price)
+    print("Reset:", obs.task_name, obs.role, obs.symbol, obs.current_price)
     for _ in range(5):
-        step_obs = env.step(TradeEnvAction(action_type=obs.target_side, quantity=100))
-        print("Step", step_obs.step_index, "reward", step_obs.reward, "remaining", step_obs.remaining_quantity)
+        step_obs = env.step(TradeEnvAction(action_type=obs.target_side, quantity=120, urgency=0.6))
+        print("Step", step_obs.step_index, "reward", step_obs.reward, "spread_bps", step_obs.spread_bps)
         if step_obs.done:
             break

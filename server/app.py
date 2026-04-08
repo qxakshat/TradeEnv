@@ -10,12 +10,26 @@ FastAPI application for the TradeEnv Environment.
 This module creates an HTTP server that exposes the TradeEnvEnvironment
 over HTTP and WebSocket endpoints, compatible with EnvClient.
 
-Endpoints:
-    - POST /reset: Reset the environment
+Multi-Role Architecture:
+    Each reset() automatically cycles through 5 distinct trading roles:
+    - aggressive_buyer: Fast execution, accepts slippage
+    - conservative_seller: High-quality, patient execution
+    - market_maker: Balanced timing, profit from volume
+    - arbitrageur: Misprice exploitation, tight costs
+    - volatility_trader: Swing trading with technical sophistication
+
+    This enforces model versatility: agents must adapt strategy to role constraints.
+
+Primary Endpoints:
+    - POST /reset: Reset the environment (cycles task + role)
     - POST /step: Execute an action
     - GET /state: Get current environment state
     - GET /schema: Get action/observation schemas
     - WS /ws: WebSocket endpoint for persistent sessions
+
+Additional UX Endpoints:
+    - GET /healthz: Container health check
+    - GET /ui-config: Frontend hints for charts and leaderboard display
 
 Usage:
     # Development (with auto-reload):
@@ -51,6 +65,32 @@ app = create_app(
     env_name="TradeEnv",
     max_concurrent_envs=4,
 )
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    """Simple readiness endpoint for HF Spaces and container probes."""
+    return {"status": "ok", "env": "TradeEnv"}
+
+
+@app.get("/ui-config")
+def ui_config() -> dict:
+    """UI metadata to enrich dashboard rendering in custom frontends."""
+    return {
+        "title": "TradeEnv — Depth-Aware Execution Arena",
+        "subtitle": "Easy → Medium → Hard tasks with role-conditional grading",
+        "cards": [
+            {"key": "task_score", "label": "Task Score", "range": [0.0, 1.0]},
+            {"key": "slippage_bps", "label": "Estimated Slippage (bps)", "range": [0, 500]},
+            {"key": "trade_efficiency", "label": "Trade Efficiency", "range": [0.0, 1.0]},
+        ],
+        "charts": [
+            {"id": "reward_breakdown", "type": "stacked_bar"},
+            {"id": "spread_and_depth", "type": "line"},
+            {"id": "score_by_role", "type": "bar"},
+        ],
+        "leaderboard": {"group_by": ["task_name", "role"], "metric": "score"},
+    }
 
 
 def main() -> None:

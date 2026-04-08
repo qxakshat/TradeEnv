@@ -11,6 +11,15 @@ from typing import Literal
 from openenv.core.env_server.types import Action, Observation
 from pydantic import BaseModel, Field
 
+# Trading role types with distinct strategies and constraints
+TradingRole = Literal[
+    "aggressive_buyer",     # Fast execution, accepts slippage
+    "conservative_seller",  # High-quality sells, patient
+    "market_maker",         # Balanced timing, profit from volume
+    "arbitrageur",          # Exploits mispricings, low slippage tolerance
+    "volatility_trader",    # Trades price swings, sophisticated timing
+]
+
 
 class TradeEnvAction(Action):
     """Agent action for bulk execution."""
@@ -25,6 +34,12 @@ class TradeEnvAction(Action):
         le=10_000,
         description="Units to execute on this step (0 allowed for hold/no-op).",
     )
+    urgency: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Execution urgency hint (0=patient, 1=aggressive).",
+    )
 
 
 class TradeEnvReward(BaseModel):
@@ -32,8 +47,12 @@ class TradeEnvReward(BaseModel):
 
     immediate_edge: float = Field(description="Price edge versus running VWAP benchmark")
     progress_bonus: float = Field(description="Reward for making required execution progress")
+    slippage_penalty: float = Field(description="Penalty for high estimated slippage and wide spread")
+    trade_efficiency_bonus: float = Field(description="Bonus for achieving target using fewer trades")
+    depth_timing_bonus: float = Field(description="Bonus for executing when order-book depth is favorable")
     constraint_penalty: float = Field(description="Penalty for invalid actions/over-trading")
     terminal_adjustment: float = Field(description="End-of-episode adjustment for completion quality")
+    role_adjustment: float = Field(description="Role-specific reward adjustment (aggressiveness, conservatism, etc.)")
     total: float = Field(description="Final scalar reward used by the environment")
 
 
@@ -42,7 +61,13 @@ class TradeEnvTaskScore(BaseModel):
 
     task_name: str
     difficulty: Literal["easy", "medium", "hard"]
-    score: float = Field(ge=0.0, le=1.0)
+    role: TradingRole
+    score: float = Field(ge=0.0, le=1.0, description="Overall task score")
+    role_metric: float = Field(ge=0.0, le=1.0, description="Role-specific performance metric")
+    quality_metric: float = Field(ge=0.0, le=1.0, description="Execution quality versus day range")
+    fill_metric: float = Field(ge=0.0, le=1.0, description="Target completion ratio")
+    slippage_metric: float = Field(ge=0.0, le=1.0, description="Execution quality versus spread and book depth")
+    efficiency_metric: float = Field(ge=0.0, le=1.0, description="Preference for lower trade count with full completion")
     rationale: str
 
 
@@ -51,10 +76,18 @@ class TradeEnvObservation(Observation):
 
     task_name: str = Field(description="Current task identifier")
     difficulty: Literal["easy", "medium", "hard"]
+    role: TradingRole = Field(description="Current trading role/strategy")
     symbol: str
     step_index: int = Field(ge=0)
     max_steps: int = Field(ge=1)
     current_price: float = Field(gt=0)
+    best_bid: float = Field(gt=0)
+    best_ask: float = Field(gt=0)
+    spread_bps: float = Field(ge=0)
+    bid_depth_top: float = Field(ge=0)
+    ask_depth_top: float = Field(ge=0)
+    depth_imbalance: float = Field(ge=-1.0, le=1.0)
+    estimated_slippage_bps: float = Field(ge=0)
     ema_fast: float = Field(gt=0)
     ema_slow: float = Field(gt=0)
     rsi_14: float = Field(ge=0, le=100)
