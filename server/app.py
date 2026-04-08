@@ -88,9 +88,39 @@ def ui_config() -> dict:
             {"id": "reward_breakdown", "type": "stacked_bar"},
             {"id": "spread_and_depth", "type": "line"},
             {"id": "score_by_role", "type": "bar"},
+            {"id": "sentiment_vs_reward", "type": "scatter"},
+        ],
+        "controls": [
+            {"id": "action_type", "label": "Action", "type": "select", "options": ["buy", "sell", "hold"]},
+            {"id": "quantity", "label": "Quantity", "type": "slider", "min": 0, "max": 1000},
+            {"id": "urgency", "label": "Urgency", "type": "slider", "min": 0.0, "max": 1.0, "step": 0.05},
         ],
         "leaderboard": {"group_by": ["task_name", "role"], "metric": "score"},
     }
+
+
+@app.get("/frontend-readme")
+def frontend_readme() -> dict:
+    """Frontend guidance for human-friendly interaction."""
+    markdown = """
+# TradeEnv Frontend Guide
+
+## Quick Start
+1. Click **Reset** to start a new episode (task + role cycle).
+2. Pick **Action** (`buy`/`sell`/`hold`), set **Quantity**, and optionally adjust **Urgency**.
+3. Watch score + reward breakdown in charts after each step.
+
+## What to watch
+- **Task Score (0-1)**: end-goal quality metric
+- **Spread / Depth**: avoid trading large size in wide-spread thin-depth moments
+- **Sentiment Signal**: optional advisory signal from Yahoo/Moneycontrol headlines
+
+## Human Tips
+- Use fewer, better-timed trades for higher efficiency.
+- On hard tasks, prioritize low slippage over raw speed.
+- Avoid tiny random trades; they are explicitly penalized.
+""".strip()
+    return {"title": "TradeEnv Frontend README", "markdown": markdown}
 
 
 def main() -> None:

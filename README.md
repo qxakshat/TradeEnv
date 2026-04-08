@@ -138,6 +138,8 @@ Per-step reward has eight components:
 - `slippage_penalty`: penalizes wide spread + high realized slippage pressure
 - `trade_efficiency_bonus`: rewards completion with fewer trades
 - `depth_timing_bonus`: rewards execution when order-book imbalance is favorable
+- `random_trade_penalty`: penalizes tiny/noisy flip-flop trades that mimic random behavior
+- `variance_penalty`: trajectory-level penalty for high execution-price variance
 - `constraint_penalty`: invalid side, excessive trading, late inactivity
 - `terminal_adjustment`: end-of-episode completion/quality adjustment
 - `role_adjustment`: role-specific terminal bonus for consistency, precision, or timing
@@ -158,6 +160,25 @@ Each step includes deterministic level-1 depth state:
 - `depth_imbalance` in `[-1, 1]`
 
 Hard tasks intentionally run thinner liquidity and wider spreads, making frontier models work harder on timing, participation rate, and slippage control.
+
+## Tiny News Sentiment Signal (Differentiator)
+
+To differentiate from `openenv-finrl`-style pure price/technical setups, TradeEnv now includes a lightweight sentiment channel:
+
+- Sources: Yahoo Finance RSS + Moneycontrol business RSS
+- Model: tiny lexical scorer (`server/news_sentiment.py`) acting as a small-LM-style baseline
+- Output in observation: `news_sentiment_score`, `news_sentiment_confidence`
+- Also returned in `metadata.info.news_sentiment` with sampled headlines
+
+Design note: sentiment is **advisory** by default and does not break deterministic grading formulas.
+
+### How this differs from openenv-finrl
+
+- **Depth-aware execution microstructure** (spread/depth/imbalance/slippage state)
+- **Role-conditional grading** (5 trading roles with different reward pressure)
+- **Anti-randomness reward shaping** (micro-trade and flip-flop penalties)
+- **Variance-aware execution objective** (terminal variance penalty)
+- **News-aware observation channel** (tiny sentiment signal for policy adaptation)
 
 ## Broker Integration Placeholders
 
@@ -204,6 +225,9 @@ uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
 
 # Optional custom UI metadata endpoint
 curl http://127.0.0.1:8000/ui-config
+
+# Optional frontend help page payload
+curl http://127.0.0.1:8000/frontend-readme
 ```
 
 ## Validate OpenEnv spec

@@ -89,6 +89,8 @@ class TradeEnvClient(
             ask_depth_top=obs_data.get("ask_depth_top", 0.0),
             depth_imbalance=obs_data.get("depth_imbalance", 0.0),
             estimated_slippage_bps=obs_data.get("estimated_slippage_bps", 0.0),
+            news_sentiment_score=obs_data.get("news_sentiment_score", 0.0),
+            news_sentiment_confidence=obs_data.get("news_sentiment_confidence", 0.0),
             ema_fast=obs_data.get("ema_fast", 1.0),
             ema_slow=obs_data.get("ema_slow", 1.0),
             rsi_14=obs_data.get("rsi_14", 50.0),

@@ -21,9 +21,11 @@ try:
         TradingRole,
     )
     from .broker_adapters import get_supported_brokers
+    from .news_sentiment import SentimentSnapshot, fetch_sentiment_snapshot
 except ImportError:
     from models import TradeEnvAction, TradeEnvObservation, TradeEnvReward, TradeEnvTaskScore, TradingRole
     from server.broker_adapters import get_supported_brokers
+    from server.news_sentiment import SentimentSnapshot, fetch_sentiment_snapshot
 
 
 NIFTY50_SYMBOLS: List[str] = [
@@ -139,6 +141,9 @@ class TradeEnvEnvironment(Environment):
         self._rsi = 50.0
         self._symbol = ""
         self._date = ""
+        self._prev_action_type = "hold"
+        self._prev_exec_qty = 0
+        self._sentiment = SentimentSnapshot(score=0.0, confidence=0.0, headlines=[], source="neutral_fallback")
 
     def reset(self) -> TradeEnvObservation:
         self._state = State(episode_id=str(uuid4()), step_count=0)
@@ -188,6 +193,8 @@ class TradeEnvEnvironment(Environment):
         self._fills = []
         self._last_reward = 0.0
         self._last_slippage_bps = 0.0
+        self._prev_action_type = "hold"
+        self._prev_exec_qty = 0
         self._last_score = TradeEnvTaskScore(
             task_name=self._task.name,
             difficulty=self._task.difficulty,
@@ -200,6 +207,9 @@ class TradeEnvEnvironment(Environment):
             efficiency_metric=0.0,
             rationale="in_progress",
         )
+
+        # Sentiment is advisory (in observation), not part of deterministic grading.
+        self._sentiment = fetch_sentiment_snapshot()
 
         return self._build_observation(done=False, reward=0.0, info={"phase": "reset", "date": self._date})
 
@@ -218,6 +228,8 @@ class TradeEnvEnvironment(Environment):
         slippage_penalty = 0.0
         trade_efficiency_bonus = 0.0
         depth_timing_bonus = 0.0
+        random_trade_penalty = 0.0
+        variance_penalty = 0.0
         constraint_penalty = 0.0
         terminal_adjustment = 0.0
         role_adjustment = 0.0
@@ -275,6 +287,17 @@ class TradeEnvEnvironment(Environment):
                     depth_favorability = 1.0 - depth_favorability
                 depth_timing_bonus = 0.05 * (depth_favorability - 0.5)
 
+                # Penalize noisy/random micro-trading and side flip behavior.
+                tiny_trade = executed_qty < max(int(0.04 * self._task.target_quantity), 1)
+                flip_flop = self._prev_action_type != "hold" and self._prev_action_type != action.action_type
+                if tiny_trade:
+                    random_trade_penalty -= 0.025
+                if flip_flop:
+                    random_trade_penalty -= 0.015
+
+                self._prev_action_type = action.action_type
+                self._prev_exec_qty = executed_qty
+
                 self._executed_qty += executed_qty
                 self._remaining_qty -= executed_qty
                 self._cum_notional += executed_qty * fill_price
@@ -297,6 +320,11 @@ class TradeEnvEnvironment(Environment):
             terminal_adjustment += (self._last_score.score - 0.5) * 0.22
             trade_efficiency_bonus = 0.10 * self._last_score.efficiency_metric
             role_adjustment = self._role.consistency_reward * self._last_score.role_metric
+            if self._fills:
+                fill_prices = np.array([p for _, p in self._fills], dtype=np.float64)
+                if len(fill_prices) >= 2:
+                    cv = float(np.std(fill_prices) / max(np.mean(fill_prices), 1e-9))
+                    variance_penalty = -0.12 * float(np.clip(cv / 0.03, 0.0, 1.0))
 
         reward_obj = TradeEnvReward(
             immediate_edge=immediate_edge,
@@ -304,6 +332,8 @@ class TradeEnvEnvironment(Environment):
             slippage_penalty=slippage_penalty,
             trade_efficiency_bonus=trade_efficiency_bonus,
             depth_timing_bonus=depth_timing_bonus,
+            random_trade_penalty=random_trade_penalty,
+            variance_penalty=variance_penalty,
             constraint_penalty=constraint_penalty,
             terminal_adjustment=terminal_adjustment,
             role_adjustment=role_adjustment,
@@ -313,6 +343,8 @@ class TradeEnvEnvironment(Environment):
                 + slippage_penalty
                 + trade_efficiency_bonus
                 + depth_timing_bonus
+                + random_trade_penalty
+                + variance_penalty
                 + constraint_penalty
                 + terminal_adjustment
                 + role_adjustment
@@ -329,6 +361,12 @@ class TradeEnvEnvironment(Environment):
             "reward_breakdown": reward_obj.model_dump(),
             "task_score": self._last_score.model_dump() if done else None,
             "broker_integration": get_supported_brokers(),
+            "news_sentiment": {
+                "score": self._sentiment.score,
+                "confidence": self._sentiment.confidence,
+                "source": self._sentiment.source,
+                "headlines": self._sentiment.headlines,
+            },
         }
 
         obs = self._build_observation(done=done, reward=reward_obj.total, info=info)
@@ -352,6 +390,8 @@ class TradeEnvEnvironment(Environment):
             ask_depth_top=float(book["ask_depth_top"]),
             depth_imbalance=float(book["depth_imbalance"]),
             estimated_slippage_bps=float(self._last_slippage_bps),
+            news_sentiment_score=float(self._sentiment.score),
+            news_sentiment_confidence=float(self._sentiment.confidence),
             ema_fast=self._ema_fast,
             ema_slow=self._ema_slow,
             rsi_14=self._rsi,
