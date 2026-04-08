@@ -11,223 +11,188 @@ tags:
   - openenv
 ---
 
-# TradeEnv: Institutional-Style Execution Environment
+# TradeEnv: Institutional Execution Arena for Agent Evaluation
 
-`TradeEnv` simulates a real execution desk task: buy/sell a large order over one trading day while minimizing market impact and maximizing fill quality.
+`TradeEnv` is an OpenEnv benchmark for a real desk workflow: execute a large buy/sell order over a trading day while balancing fill completion, market impact, slippage, and action-budget constraints.
 
-This is a **real-world utility** benchmark for agentic decision-making in finance execution workflows.
+This benchmark is built for **agent evaluation**, not just backtesting. It explicitly tests adaptation across task difficulty and trading-role objectives.
 
-## Motivation
+## Why judges should care (rubric-aligned)
 
-Human traders split large orders over time while reacting to market signals (price, EMA, RSI, spread regimes). This environment evaluates whether an agent can:
+| Rubric category | How TradeEnv addresses it |
+|---|---|
+| **Real-world utility (30%)** | Models execution quality under spread/depth pressure, action budgets, and completion deadlines. This mirrors buy-side/sell-side execution desks and paper-trading assistants. |
+| **Task & grader quality (25%)** | 3 tasks (`easy`, `medium`, `hard`) + 5 role variants. Deterministic, clipped scoring in `[0,1]` with transparent components (`quality`, `fill`, `slippage`, `efficiency`, `role_metric`). |
+| **Environment design (20%)** | `reset()` creates clean state and new episode id; typed action/observation contracts; dense reward decomposition with stepwise signal + sensible terminal logic. |
+| **Code quality & spec compliance (15%)** | OpenEnv manifest in `openenv.yaml`; Docker-first runtime; FastAPI app + health endpoint; reproducible baseline runner in `inference.py`. |
+| **Creativity & novelty (10%)** | Combines execution microstructure + role-conditioned grading + fundamentals + lightweight sentiment context, which is uncommon in OpenEnv finance environments. |
 
-- Minimize buy execution price
-- Maximize sell execution price
-- Respect hard constraints: at most `k <= 10` trades/day
-- Complete inventory under time pressure
+---
 
-## OpenEnv Interface Compliance
+## 1) Real-world utility
 
-The environment implements typed Pydantic models and OpenEnv primitives:
+Institutional execution is a practical RL/agent problem with clear operational constraints:
 
-- `TradeEnvAction` (typed action)
-- `TradeEnvObservation` (typed observation)
-- `TradeEnvReward` (typed reward decomposition)
-- `step(action)` returns transition semantics `(observation, reward, done, info)` internally, and returns `Observation` object with OpenEnv-compatible `reward/done/metadata` fields
-- `reset()` returns initial observation
-- `state` endpoint provides current environment state (`episode_id`, `step_count`)
+- **Primary objective**: buy near lower prices / sell near higher prices while completing inventory.
+- **Operational constraints**: max trades per episode, finite time horizon, side-valid actions only.
+- **Microstructure pressure**: spread, top-of-book depth, and depth imbalance influence realized slippage.
+- **Execution trade-off**: speed vs quality (fast fills often cost more).
 
-Manifest: `openenv.yaml`
+TradeEnv is useful for evaluating whether an agent can make **sequential, constrained decisions** under realistic market frictions.
 
-Validation:
+## 2) Task and grader quality
 
-- `openenv validate`
-- Verified locally on 2026-04-08: `openenv validate` returned **Ready for multi-mode deployment**
+### Tasks (difficulty ladder)
 
-## Observation and Action Space
-
-### Action (`TradeEnvAction`)
-
-- `action_type`: `buy | sell | hold`
-- `quantity`: integer shares for current step
-- `urgency`: continuous value in `[0, 1]` (patient → aggressive execution)
-
-### Observation (`TradeEnvObservation`)
-
-Includes:
-
-- task metadata: `task_name`, `difficulty`, `role`
-- market: `symbol`, `current_price`, `best_bid`, `best_ask`, `spread_bps`, `bid_depth_top`, `ask_depth_top`, `depth_imbalance`, `estimated_slippage_bps`, `ema_fast`, `ema_slow`, `rsi_14`
-- fundamentals: `pe_ratio`, `price_to_book`, `return_on_equity`, `debt_to_equity`, `profit_margin`, `revenue_growth`, `fundamental_quality_score`
-- news context: `news_sentiment_score`, `news_sentiment_confidence`
-- execution state: `target_side`, `target_quantity`, `remaining_quantity`, `executed_quantity`, `avg_execution_price`
-- constraints: `trades_used`, `max_trades_per_day`
-- OpenEnv fields: `reward`, `done`, `metadata`
-
-## Tasks (3 levels + deterministic graders)
-
-1. **easy_buy_quality (easy)**
-   - Objective: buy near daily lows with complete fill
-   - Symbols: stable liquid names
+1. **`easy_buy_quality`**
+   - Side: buy
    - Max trades: 10
+   - Objective: complete while staying closer to day lows
 
-2. **medium_sell_quality (medium)**
-   - Objective: sell near daily highs while completing inventory
-   - Symbols: mixed regimes
+2. **`medium_sell_quality`**
+   - Side: sell
    - Max trades: 8
+   - Objective: complete while staying closer to day highs
 
-3. **hard_depth_aware_execution (hard)**
-   - Objective: buy volatile names under thin market depth with strict action budget and low slippage
-   - Symbols: higher-volatility names
+3. **`hard_depth_aware_execution`**
+   - Side: buy
    - Max trades: 6
+   - Objective: volatile symbols, thinner liquidity, stricter budget, slippage control
 
-### Deterministic scoring (0.0–1.0)
+### Deterministic scoring (strictly 0.0–1.0)
 
-Graders score each task with reproducible formulas using:
+All core metrics are clipped to `[0,1]`:
 
-- execution quality vs day low/high
-- fill completion ratio
-- slippage metric (bps-normalized)
-- trade efficiency (fewer trades, complete fill)
+- `quality_metric`: execution quality inside daily range
+- `fill_metric`: completion ratio
+- `slippage_metric`: slippage-normalized quality
+- `efficiency_metric`: preference for fewer trades
+- `role_metric`: role-specific execution fit
 
-All component metrics and final score are clipped to `[0.0, 1.0]`.
+Task score is deterministic for fixed episode trajectory/actions:
 
-Scores are deterministic for the same episode data and actions.
+- Easy: `0.70*quality + 0.20*fill + 0.10*slippage`
+- Medium: `0.55*quality + 0.25*fill + 0.15*slippage + 0.05*efficiency`
+- Hard: `0.35*quality + 0.25*fill + 0.25*slippage + 0.15*efficiency`
 
-## Trading Roles (5 distinct strategies)
+### Why hard is genuinely hard
 
-Each episode cycles through a **trading role** that determines constraints, reward weights, and grading criteria:
+Hard mode compounds difficulty through:
 
-### 1. **Aggressive Buyer**
-   - Strategy: Fast completion, accepts slippage for speed
-   - Slippage factor: 1.3× (higher cost for faster execution)
-   - Graded on: Speed (early execution finish) + quality of fills
-   - Reward weights: Speed bonus 30%, Quality 40%
+- lower liquidity multiplier,
+- wider spreads,
+- fewer allowed actions,
+- larger target size,
+- role-conditioned reward pressure.
 
-### 2. **Conservative Seller**
-   - Strategy: Patient, high-quality execution; waits for best prices
-   - Slippage factor: 0.7× (tight pricing)
-   - Graded on: Precision (target qty accuracy) + quality
-   - Reward weights: Quality 60%, Consistency bonus 8%
+This punishes naive fixed-rate policies and rewards adaptive timing/participation control.
 
-### 3. **Market Maker**
-   - Strategy: Balanced timing; captures both sides profitably
-   - Slippage factor: 0.9× (near-market)
-   - Graded on: Balanced fills + quantity completion
-   - Reward weights: Quality 35%, Fill balance 15%, Consistency 15%
+## 3) Environment design quality
 
-### 4. **Arbitrageur**
-   - Strategy: Exploits mispricings; highly sensitive to costs
-   - Slippage factor: 0.5× (minimal slippage tolerance)
-   - Graded on: Extreme precision; any overspend penalized
-   - Reward weights: Quality 70% (must be excellent)
+### Clean reset semantics
 
-### 5. **Volatility Trader**
-   - Strategy: Trades price swings; exploits technical signals
-   - Slippage factor: 0.8× (balanced execution costs)
-   - Graded on: Timing (when fills happen) + quality
-   - Reward weights: Quality 50%, Timing 20%, Technical sophistication 12%
+`reset()`:
 
-**Role Cycling**: Each `reset()` automatically cycles to the next role. Agents must adapt strategy to the current role's constraints and reward structure.
+- creates a fresh `episode_id`,
+- resets counters (`step_count`, fill/cost trackers, trade count),
+- rotates task and role,
+- rebuilds per-episode market/depth trajectory,
+- returns initial typed observation.
 
+### Action and observation contracts
 
-## Reward Function (Dense & Meaningful)
+- **Action** (`TradeEnvAction`):
+  - `action_type`: `buy | sell | hold`
+  - `quantity`: integer `0..10000`
+  - `urgency`: float `[0,1]`
 
-Per-step reward has eight components:
+- **Observation** (`TradeEnvObservation`) includes:
+  - task/role (`task_name`, `difficulty`, `role`)
+  - market microstructure (`best_bid`, `best_ask`, `spread_bps`, `bid_depth_top`, `ask_depth_top`, `depth_imbalance`)
+  - technical context (`ema_fast`, `ema_slow`, `rsi_14`)
+  - fundamentals (`pe_ratio`, `price_to_book`, `return_on_equity`, `debt_to_equity`, `profit_margin`, `revenue_growth`, `fundamental_quality_score`)
+  - sentiment (`news_sentiment_score`, `news_sentiment_confidence`)
+  - execution state (`remaining_quantity`, `executed_quantity`, `trades_used`, etc.)
 
-- `immediate_edge`: fill quality vs running VWAP benchmark
-- `progress_bonus`: reward for advancing toward target quantity (role-adjusted)
-- `slippage_penalty`: penalizes wide spread + high realized slippage pressure
-- `trade_efficiency_bonus`: rewards completion with fewer trades
-- `depth_timing_bonus`: rewards execution when order-book imbalance is favorable
-- `random_trade_penalty`: penalizes tiny/noisy flip-flop trades that mimic random behavior
-- `variance_penalty`: trajectory-level penalty for high execution-price variance
-- `constraint_penalty`: invalid side, excessive trading, late inactivity
-- `terminal_adjustment`: end-of-episode completion/quality adjustment
-- `role_adjustment`: role-specific terminal bonus for consistency, precision, or timing
+### Reward signal design (dense, non-sparse)
 
-This gives trajectory-level signal (not just terminal binary reward) and role-specific incentives.
+Per-step reward decomposes into:
 
-## Data Source
+- positive terms: `immediate_edge`, `progress_bonus`, `depth_timing_bonus`, `trade_efficiency_bonus`
+- penalties: `slippage_penalty`, `random_trade_penalty`, `variance_penalty`, `constraint_penalty`
+- terminal shaping: `terminal_adjustment`, `role_adjustment`
 
-- Pulls last 5 months from `yfinance` for a NIFTY-50 subset (`*.NS`)
-- Builds deterministic synthetic intraday path per day from OHLC anchors to simulate execution slices
+This yields informative gradients across the episode instead of only terminal success/fail.
 
-## Simulated Market Depth (Novelty)
+### Episode boundaries
 
-Each step includes deterministic level-1 depth state:
+An episode ends when:
 
-- `best_bid`, `best_ask`, `spread_bps`
-- `bid_depth_top`, `ask_depth_top`
-- `depth_imbalance` in `[-1, 1]`
+- target quantity is fully executed, **or**
+- max trajectory length is reached.
 
-Hard tasks intentionally run thinner liquidity and wider spreads, making frontier models work harder on timing, participation rate, and slippage control.
+Unfilled quantity at terminal step is force-closed with explicit penalty, preventing degenerate “do nothing” policies.
 
-## Tiny News Sentiment Signal (Differentiator)
+## 4) Code quality and OpenEnv compliance
 
-To differentiate from `openenv-finrl`-style pure price/technical setups, TradeEnv now includes a lightweight sentiment channel:
+### OpenEnv interface
 
-- Sources: Yahoo Finance RSS + Moneycontrol business RSS
-- Model: tiny lexical scorer (`server/news_sentiment.py`) acting as a small-LM-style baseline
-- Output in observation: `news_sentiment_score`, `news_sentiment_confidence`
-- Also returned in `metadata.info.news_sentiment` with sampled headlines
+- Manifest: `openenv.yaml`
+- Runtime: FastAPI (`server.app:app`)
+- Typed models: `models.py`
+- Environment implementation: `server/tradeenv_environment.py`
 
-Design note: sentiment is **advisory** by default and does not break deterministic grading formulas.
+### Validation and reproducibility protocol
 
-## Web Fundamentals Signal (Differentiator)
+Recommended checks for judges:
 
-TradeEnv now augments each episode with website-sourced fundamentals per symbol:
+1. `openenv validate`
+2. `docker build && docker run`
+3. `GET /healthz` responds
+4. Baseline run via `inference.py` (deterministic heuristic mode)
 
-- Yahoo key statistics page
-- Yahoo quoteSummary endpoint (`defaultKeyStatistics`, `financialData`, `summaryDetail`)
-- Moneycontrol site link in source attribution
+`inference.py` is deterministic by default (`POLICY_MODE=heuristic`) and prints structured logs (`[START]`, `[STEP]`, `[END]`) plus per-episode score and mean score.
 
-The environment caches a weekly `data/fundamentals_snapshot.csv` and exposes values + source URLs via:
+### HF Space readiness
 
-- observation fields (`pe_ratio`, `price_to_book`, `return_on_equity`, `debt_to_equity`, `profit_margin`, `revenue_growth`, `fundamental_quality_score`)
-- metadata (`metadata.info.fundamentals.sources`)
-- app endpoint `GET /dashboard-snapshot`
+- Docker SDK frontmatter and app port are declared in this README header.
+- Root route redirects to `/dashboard`.
+- Health and dashboard APIs are available for smoke tests.
 
-### How this differs from openenv-finrl
+## 5) Creativity and novelty
 
-- **Depth-aware execution microstructure** (spread/depth/imbalance/slippage state)
-- **Web fundamentals channel** (valuation + balance-sheet quality features from finance websites)
-- **Role-conditional grading** (5 trading roles with different reward pressure)
-- **Anti-randomness reward shaping** (micro-trade and flip-flop penalties)
-- **Variance-aware execution objective** (terminal variance penalty)
-- **News-aware observation channel** (tiny sentiment signal for policy adaptation)
+TradeEnv is not a plain price-prediction environment. It introduces:
 
-## Broker Integration Placeholders
+1. **Depth-aware execution microstructure** (spread/depth/imbalance-driven frictions)
+2. **Role-conditional evaluation** (5 role archetypes with different objective pressure)
+3. **Anti-randomness shaping** (tiny-trade and flip-flop penalties)
+4. **Trajectory stability objective** (variance penalty on fill prices)
+5. **Context channels beyond price** (fundamentals + advisory news sentiment)
 
-The environment ships with safe stubs for future broker integration:
+This combination creates a richer policy-learning target than many standard finance benchmarks.
 
-- `server/broker_adapters.py`
-   - `ZerodhaAdapter` (placeholder)
-   - `PaytmMoneyAdapter` (placeholder)
+---
 
-No live brokerage calls are performed in hackathon mode; integration points are exposed via `metadata.info.broker_integration`.
+## Trading roles (policy adaptation challenge)
 
-## Baseline Inference Script
+Every `reset()` rotates roles, forcing strategy adaptation:
 
-`inference.py`:
+- `aggressive_buyer`
+- `conservative_seller`
+- `market_maker`
+- `arbitrageur`
+- `volatility_trader`
 
-- Uses **OpenAI Python client**
-- Reads credentials from `OPENAI_API_KEY`
-- Runs all 3 tasks + 5 roles in deterministic order
-- Default policy mode is deterministic `heuristic` for reproducible grading runs
-- Optional mode: `POLICY_MODE=openai` for LLM-driven policy
-- Emits `[START]`, `[STEP]`, `[END]` logs per episode
-- Reports reproducible 0–1 score for each (task, role) combination and mean score
+No single static policy dominates across all role/task pairs.
 
-## Multi-Role Architecture
+## Data and realism notes
 
-The environment enforces **model versatility**: by cycling through 5 distinct trading roles, agents must learn adaptive strategies:
+- Daily OHLCV source: `yfinance` (NIFTY-50 subset)
+- Intraday execution path: deterministic synthetic interpolation from daily anchors
+- Depth state: deterministic simulation (proxy, not exchange L2 tape)
+- Paper trading endpoints are virtual and non-broker-connected
 
-- **No single optimal policy**: aggressive buyer strategy fails against conservative seller constraints
-- **Emergent role-awareness**: superior agents develop role-specific execution plans
-- **Meaningful complexity**: naive agents may score well on easy buys but fail on arbitrage-style precision
-
-This mirrors real trading desks where portfolio managers shift strategies based on market regime, position type, and risk appetite.
+This intentionally balances realism, safety, and reproducibility.
 
 ## Setup
 
@@ -239,41 +204,7 @@ uv sync
 
 ```bash
 uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
-
-# New powerful dashboard UI (HF-style)
 open http://127.0.0.1:8000/dashboard
-
-# Optional custom UI metadata endpoint
-curl http://127.0.0.1:8000/ui-config
-
-# Optional frontend help page payload
-curl http://127.0.0.1:8000/frontend-readme
-
-# Optional dashboard sample with source-backed fundamentals values
-curl http://127.0.0.1:8000/dashboard-snapshot
-
-# Live market APIs used by dashboard
-curl http://127.0.0.1:8000/api/market/overview?days=30
-curl http://127.0.0.1:8000/api/market/history/RELIANCE.NS?days=30
-curl http://127.0.0.1:8000/api/portfolio/demo
-
-# Agent + paper trading APIs
-curl http://127.0.0.1:8000/api/agent/specs
-curl -X POST http://127.0.0.1:8000/api/agent/suggest -H "Content-Type: application/json" -d '{"symbol":"RELIANCE.NS"}'
-curl http://127.0.0.1:8000/api/paper/state
-curl -X POST http://127.0.0.1:8000/api/paper/trade -H "Content-Type: application/json" -d '{"symbol":"RELIANCE.NS","side":"buy","qty":10}'
-curl -X POST http://127.0.0.1:8000/api/paper/reset
-
-# Human OpenEnv gameplay APIs (step/reset loop from UI)
-curl -X POST http://127.0.0.1:8000/api/human/session/new
-curl -X POST http://127.0.0.1:8000/api/human/reset -H "Content-Type: application/json" -d '{"session_id":"<id>"}'
-curl -X POST http://127.0.0.1:8000/api/human/step -H "Content-Type: application/json" -d '{"session_id":"<id>","action_type":"buy","quantity":100,"urgency":0.5}'
-
-### Data realism disclaimer in dashboard
-
-- Real market OHLC/quotes in dashboard come from Yahoo Finance (`yfinance`) snapshots.
-- Environment depth metrics and execution microstructure blocks are **simulated proxies**.
-- Paper trades are virtual and **not connected to broker/exchange execution**.
 ```
 
 ## Validate OpenEnv spec
@@ -282,7 +213,7 @@ curl -X POST http://127.0.0.1:8000/api/human/step -H "Content-Type: application/
 openenv validate
 ```
 
-## Build & run container
+## Build and run container
 
 ```bash
 docker build -t tradeenv:latest .
@@ -295,8 +226,6 @@ docker run --rm -p 8000:8000 tradeenv:latest
 openenv push
 ```
 
-The repo is Docker-first and tagged for OpenEnv Spaces (`tags: [openenv]`).
-
 ## Baseline run
 
 ```bash
@@ -304,19 +233,13 @@ export OPENAI_API_KEY=<your_key>
 uv run python inference.py
 ```
 
-If the OpenAI API is unavailable, the script falls back to a deterministic safe policy so the benchmark still completes end-to-end.
-
-The notebook `notebooks/hackathon_project.ipynb` also contains a saved DL-policy vs random-baseline comparison for the hackathon submission workflow.
-
-It now includes fundamentals-augmented feature engineering (12-dim input with valuation/profitability/growth signals) so training reflects both microstructure and company quality.
+If remote LLM is unavailable, baseline still runs in deterministic heuristic mode.
 
 ## Project structure
 
-- `models.py`: typed Action/Observation/Reward models
-- `server/tradeenv_environment.py`: environment, reward shaping, tasks, graders
-- `server/broker_adapters.py`: placeholder broker connectors (Zerodha, Paytm Money)
-- `client.py`: typed OpenEnv client
-- `inference.py`: OpenAI baseline over 3 tasks
-- `openenv.yaml`: environment manifest
-- `Dockerfile`: root container image for local/HF deployment
-- `server/Dockerfile`: mirrored build file kept for OpenEnv-oriented workflows
+- `models.py` — typed action/observation/reward/score contracts
+- `server/tradeenv_environment.py` — tasks, reward shaping, deterministic grader
+- `server/app.py` — OpenEnv-compatible FastAPI server + dashboard APIs
+- `inference.py` — reproducible baseline runner
+- `openenv.yaml` — OpenEnv manifest
+- `Dockerfile` — container entrypoint for local/HF deployment
