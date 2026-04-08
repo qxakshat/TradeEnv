@@ -5,7 +5,10 @@ Design goal: minimal dependency, deterministic scoring logic, optional live feed
 
 from __future__ import annotations
 
+import json
+import pathlib
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
@@ -76,6 +79,43 @@ def _read_rss_titles(url: str, max_items: int = 8) -> List[str]:
     return titles
 
 
+def _cache_path() -> pathlib.Path:
+    return pathlib.Path(__file__).parent.parent / "data" / "sentiment_snapshot.json"
+
+
+def _save_snapshot_cache(snapshot: SentimentSnapshot) -> None:
+    path = _cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "score": snapshot.score,
+        "confidence": snapshot.confidence,
+        "headlines": snapshot.headlines,
+        "source": snapshot.source,
+        "cached_at_epoch": int(time.time()),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_snapshot_cache(max_age_seconds: int = 48 * 3600) -> SentimentSnapshot | None:
+    path = _cache_path()
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        cached_at = int(payload.get("cached_at_epoch", 0))
+        age = int(time.time()) - cached_at
+        if max_age_seconds > 0 and age > max_age_seconds:
+            return None
+        return SentimentSnapshot(
+            score=float(payload.get("score", 0.0)),
+            confidence=float(payload.get("confidence", 0.0)),
+            headlines=list(payload.get("headlines", []))[:8],
+            source=str(payload.get("source", "cache_fallback")) + "_cache",
+        )
+    except Exception:
+        return None
+
+
 def fetch_sentiment_snapshot() -> SentimentSnapshot:
     """Fetch and score tiny headline set from Yahoo + Moneycontrol RSS.
 
@@ -97,6 +137,15 @@ def fetch_sentiment_snapshot() -> SentimentSnapshot:
         except Exception:
             continue
 
-    score, confidence = score_headlines(all_titles)
-    source = "+".join(used_sources) if used_sources else "neutral_fallback"
-    return SentimentSnapshot(score=score, confidence=confidence, headlines=all_titles[:8], source=source)
+    if all_titles:
+        score, confidence = score_headlines(all_titles)
+        source = "+".join(used_sources)
+        snapshot = SentimentSnapshot(score=score, confidence=confidence, headlines=all_titles[:8], source=source)
+        _save_snapshot_cache(snapshot)
+        return snapshot
+
+    cached = _load_snapshot_cache(max_age_seconds=48 * 3600)
+    if cached is not None:
+        return cached
+
+    return SentimentSnapshot(score=0.0, confidence=0.0, headlines=[], source="neutral_fallback")

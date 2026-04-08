@@ -264,6 +264,11 @@ curl http://127.0.0.1:8000/api/paper/state
 curl -X POST http://127.0.0.1:8000/api/paper/trade -H "Content-Type: application/json" -d '{"symbol":"RELIANCE.NS","side":"buy","qty":10}'
 curl -X POST http://127.0.0.1:8000/api/paper/reset
 
+# Human OpenEnv gameplay APIs (step/reset loop from UI)
+curl -X POST http://127.0.0.1:8000/api/human/session/new
+curl -X POST http://127.0.0.1:8000/api/human/reset -H "Content-Type: application/json" -d '{"session_id":"<id>"}'
+curl -X POST http://127.0.0.1:8000/api/human/step -H "Content-Type: application/json" -d '{"session_id":"<id>","action_type":"buy","quantity":100,"urgency":0.5}'
+
 ### Data realism disclaimer in dashboard
 
 - Real market OHLC/quotes in dashboard come from Yahoo Finance (`yfinance`) snapshots.

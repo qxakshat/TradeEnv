@@ -619,54 +619,6 @@ class TradeEnvEnvironment(Environment):
         import pathlib
 
         csv_path = pathlib.Path(__file__).parent.parent / "data" / "nifty50_market_data.csv"
-        if csv_path.exists():
-            print(f"Loading market data from {csv_path}")
-            return pd.read_csv(csv_path)
-
-        raw = yf.download(
-            tickers=symbols,
-            period="5mo",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="ticker",
-            threads=False,
-        )
-
-        rows: List[pd.DataFrame] = []
-        for sym in symbols:
-            if isinstance(raw.columns, pd.MultiIndex):
-                if sym not in raw.columns.get_level_values(0):
-                    continue
-                sdf = raw[sym].copy()
-            else:
-                sdf = raw.copy()
-
-            if sdf.empty:
-                continue
-            sdf = sdf.rename(columns={c: c.lower() for c in sdf.columns})
-            req = ["open", "high", "low", "close", "volume"]
-            if not set(req).issubset(set(sdf.columns)):
-                continue
-
-            sdf = sdf[req].dropna().copy()
-            sdf["symbol"] = sym
-            rows.append(sdf)
-
-        if not rows:
-            raise RuntimeError(
-                "No market data downloaded from yfinance for provided NIFTY symbols. "
-                "Run the data download script in notebooks/hackathon_project.ipynb "
-                "to fetch and save NIFTY50 price data, then commit it to the repo."
-            )
-
-        df = pd.concat(rows).reset_index().rename(columns={"Date": "date", "index": "date"})
-        if "date" not in df.columns:
-            df = df.rename(columns={df.columns[0]: "date"})
-
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-        df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
-
         def _feat(group: pd.DataFrame) -> pd.DataFrame:
             g = group.copy()
             g["ema_fast"] = g["close"].ewm(span=5, adjust=False).mean()
@@ -681,7 +633,67 @@ class TradeEnvEnvironment(Environment):
             g["vwap"] = (g["close"] * g["volume"]).cumsum() / np.maximum(g["volume"].cumsum(), 1.0)
             return g
 
-        return df.groupby("symbol", group_keys=False).apply(_feat).reset_index(drop=True)
+        def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+            out = df.copy()
+            if "date" not in out.columns:
+                out = out.rename(columns={out.columns[0]: "date"})
+            out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+            out = out.sort_values(["symbol", "date"]).reset_index(drop=True)
+            required_cols = {"ema_fast", "ema_slow", "rsi_14", "vwap"}
+            if not required_cols.issubset(set(out.columns)):
+                out = out.groupby("symbol", group_keys=False).apply(_feat).reset_index(drop=True)
+            return out
+
+        # Web-first: try fresh yfinance data first.
+        try:
+            raw = yf.download(
+                tickers=symbols,
+                period="5mo",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="ticker",
+                threads=False,
+            )
+
+            rows: List[pd.DataFrame] = []
+            for sym in symbols:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    if sym not in raw.columns.get_level_values(0):
+                        continue
+                    sdf = raw[sym].copy()
+                else:
+                    sdf = raw.copy()
+
+                if sdf.empty:
+                    continue
+                sdf = sdf.rename(columns={c: c.lower() for c in sdf.columns})
+                req = ["open", "high", "low", "close", "volume"]
+                if not set(req).issubset(set(sdf.columns)):
+                    continue
+
+                sdf = sdf[req].dropna().copy()
+                sdf["symbol"] = sym
+                rows.append(sdf)
+
+            if rows:
+                fresh = pd.concat(rows).reset_index().rename(columns={"Date": "date", "index": "date"})
+                fresh = _normalize_df(fresh)
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                fresh.to_csv(csv_path, index=False)
+                return fresh
+        except Exception:
+            pass
+
+        # Fallback: cached local data folder CSV.
+        if csv_path.exists():
+            cached = pd.read_csv(csv_path)
+            return _normalize_df(cached)
+
+        raise RuntimeError(
+            "No market data available: web fetch failed and local fallback file is missing at "
+            f"{csv_path}. Run notebooks/hackathon_project.ipynb to generate data."
+        )
 
     @staticmethod
     def _build_episode_table(df: pd.DataFrame) -> pd.DataFrame:

@@ -51,16 +51,21 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import TradeEnvAction, TradeEnvObservation
-    from .tradeenv_environment import TradeEnvEnvironment
+    from .tradeenv_environment import TASKS, TradeEnvEnvironment
+    from .fundamentals import load_or_fetch_fundamentals
 except ImportError:
     from models import TradeEnvAction, TradeEnvObservation
-    from server.tradeenv_environment import TradeEnvEnvironment
+    from server.tradeenv_environment import TASKS, TradeEnvEnvironment
+    from server.fundamentals import load_or_fetch_fundamentals
 
 import time
 import threading
+import pathlib
+from uuid import uuid4
 from functools import lru_cache
 
 import yfinance as yf
+import pandas as pd
 from fastapi import Body, Query
 from fastapi.responses import RedirectResponse
 from fastapi.responses import HTMLResponse
@@ -90,6 +95,10 @@ PAPER_ACCOUNT = {
     "trades": [],
 }
 
+HUMAN_LOCK = threading.Lock()
+HUMAN_SESSIONS: dict[str, TradeEnvEnvironment] = {}
+HUMAN_SYMBOLS: list[str] = sorted({s for task in TASKS for s in task.symbols})
+
 
 def _safe_float(v: object, default: float = 0.0) -> float:
     try:
@@ -104,15 +113,19 @@ def _safe_float(v: object, default: float = 0.0) -> float:
 def _cached_market_snapshot(cache_key: int, days: int) -> dict:
     """Cached market data snapshot (cache key is minute bucket)."""
     del cache_key
-    raw = yf.download(
-        tickers=NIFTY50_DASHBOARD,
-        period=f"{max(days, 5)}d",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        group_by="ticker",
-        threads=False,
-    )
+    raw = pd.DataFrame()
+    try:
+        raw = yf.download(
+            tickers=NIFTY50_DASHBOARD,
+            period=f"{max(days, 5)}d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=False,
+        )
+    except Exception:
+        raw = pd.DataFrame()
 
     symbols_payload = []
     for sym in NIFTY50_DASHBOARD:
@@ -143,6 +156,45 @@ def _cached_market_snapshot(cache_key: int, days: int) -> dict:
             )
         except Exception:
             continue
+
+    if not symbols_payload:
+        csv_path = pathlib.Path(__file__).parent.parent / "data" / "nifty50_market_data.csv"
+        if csv_path.exists():
+            try:
+                local = pd.read_csv(csv_path)
+                if {"symbol", "date", "close"}.issubset(local.columns):
+                    local = local.copy()
+                    local["date"] = pd.to_datetime(local["date"], errors="coerce")
+                    local = local.dropna(subset=["date"]).sort_values(["symbol", "date"])
+                    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=max(days, 5))
+                    recent = local[local["date"] >= cutoff]
+                    if recent.empty:
+                        recent = local
+
+                    for sym in NIFTY50_DASHBOARD:
+                        sdf = recent[recent["symbol"] == sym]
+                        if sdf.empty:
+                            continue
+                        close = sdf["close"].dropna()
+                        if close.empty:
+                            continue
+                        last = _safe_float(close.iloc[-1], 0.0)
+                        prev = _safe_float(close.iloc[-2], last) if len(close) >= 2 else last
+                        chg = last - prev
+                        pct = (chg / max(prev, 1e-9)) * 100.0
+                        volume_col = "volume" if "volume" in sdf.columns else None
+                        volume = int(_safe_float(sdf[volume_col].iloc[-1], 0.0)) if volume_col else 0
+                        symbols_payload.append(
+                            {
+                                "symbol": sym,
+                                "price": round(last, 4),
+                                "change": round(chg, 4),
+                                "change_pct": round(pct, 4),
+                                "volume": volume,
+                            }
+                        )
+            except Exception:
+                pass
 
     symbols_payload.sort(key=lambda x: x["change_pct"], reverse=True)
     return {
@@ -205,6 +257,99 @@ def _latest_price(symbol: str) -> float:
     return 0.0
 
 
+def _serialize_observation(obs: TradeEnvObservation) -> dict:
+    to_dict = obs.model_dump() if hasattr(obs, "model_dump") else dict(obs)
+    return {
+        "task_name": to_dict.get("task_name"),
+        "role": to_dict.get("role"),
+        "symbol": to_dict.get("symbol"),
+        "step_index": to_dict.get("step_index"),
+        "max_steps": to_dict.get("max_steps"),
+        "current_price": to_dict.get("current_price"),
+        "target_side": to_dict.get("target_side"),
+        "target_quantity": to_dict.get("target_quantity"),
+        "remaining_quantity": to_dict.get("remaining_quantity"),
+        "executed_quantity": to_dict.get("executed_quantity"),
+        "trades_used": to_dict.get("trades_used"),
+        "max_trades_per_day": to_dict.get("max_trades_per_day"),
+        "reward": to_dict.get("reward", 0.0),
+        "done": to_dict.get("done", False),
+    }
+
+
+def _get_or_create_human_env(session_id: str | None = None) -> tuple[str, TradeEnvEnvironment]:
+    with HUMAN_LOCK:
+        if session_id and session_id in HUMAN_SESSIONS:
+            return session_id, HUMAN_SESSIONS[session_id]
+        new_id = session_id or str(uuid4())
+        env = TradeEnvEnvironment()
+        HUMAN_SESSIONS[new_id] = env
+        return new_id, env
+
+
+def _reset_human_env_to_symbol(env: TradeEnvEnvironment, symbol: str | None = None) -> TradeEnvObservation:
+    target = (symbol or "").upper().strip()
+    if target and target not in HUMAN_SYMBOLS:
+        target = ""
+
+    obs = env.reset()
+    if not target:
+        return obs
+
+    max_tries = max(1, len(TASKS) * len(HUMAN_SYMBOLS))
+    for _ in range(max_tries):
+        if (obs.symbol or "").upper() == target:
+            return obs
+        obs = env.reset()
+    return obs
+
+
+@lru_cache(maxsize=64)
+def _cached_symbol_fundamentals(cache_day: int, symbol: str) -> dict:
+    del cache_day
+    normalized = symbol.upper().strip()
+    if normalized not in NIFTY50_DASHBOARD:
+        normalized = "RELIANCE.NS"
+
+    snapshot = load_or_fetch_fundamentals(
+        NIFTY50_DASHBOARD,
+        cache_path=pathlib.Path(__file__).parent.parent / "data" / "fundamentals_snapshot.csv",
+    )
+    table = snapshot.table
+    row_df = table[table["symbol"] == normalized]
+
+    if row_df.empty:
+        return {
+            "symbol": normalized,
+            "pe_ratio": 0.0,
+            "price_to_book": 0.0,
+            "return_on_equity": 0.0,
+            "debt_to_equity": 0.0,
+            "profit_margin": 0.0,
+            "revenue_growth": 0.0,
+            "fundamental_quality_score": 0.0,
+            "sources": snapshot.source_urls.get(normalized, []),
+        }
+
+    row = row_df.iloc[0]
+    return {
+        "symbol": normalized,
+        "pe_ratio": round(_safe_float(row.get("pe_ratio", 0.0), 0.0), 4),
+        "price_to_book": round(_safe_float(row.get("price_to_book", 0.0), 0.0), 4),
+        "return_on_equity": round(_safe_float(row.get("return_on_equity", 0.0), 0.0), 4),
+        "debt_to_equity": round(_safe_float(row.get("debt_to_equity", 0.0), 0.0), 4),
+        "profit_margin": round(_safe_float(row.get("profit_margin", 0.0), 0.0), 4),
+        "revenue_growth": round(_safe_float(row.get("revenue_growth", 0.0), 0.0), 4),
+        "fundamental_quality_score": round(_safe_float(row.get("fundamental_quality_score", 0.0), 0.0), 4),
+        "sources": snapshot.source_urls.get(normalized, []),
+    }
+
+
+def _get_symbol_fundamentals(symbol: str) -> dict:
+    day_bucket = int(time.time() // (24 * 3600))
+    return _cached_symbol_fundamentals(day_bucket, symbol)
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     """Simple readiness endpoint for HF Spaces and container probes."""
@@ -219,7 +364,7 @@ def root_redirect() -> RedirectResponse:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
-        """Light professional dashboard with market, agent, and paper-trading panels."""
+    """Light professional dashboard with market intelligence panels."""
         return """
 <!doctype html>
 <html>
@@ -235,28 +380,42 @@ def dashboard() -> str:
         }
         * { box-sizing:border-box; }
         body { margin:0; font-family:Inter,system-ui,Arial,sans-serif; background:var(--bg); color:var(--text); }
-        .wrap { max-width:1440px; margin:0 auto; padding:18px; }
-        .header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:14px; gap:12px; }
+        .wrap { max-width:1380px; margin:0 auto; padding:12px; }
+        .header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px; gap:10px; }
         .title { font-size:30px; font-weight:700; margin:0; }
         .subtitle { color:var(--muted); margin-top:4px; }
         .badge { display:inline-block; background:#fff7df; color:var(--warning); border:1px solid #f0ddb2; border-radius:999px; padding:5px 10px; font-size:12px; margin-right:6px; }
         .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
         input,select,button { border-radius:10px; border:1px solid var(--line); padding:8px 10px; font-size:13px; background:#fff; color:var(--text); }
         button { background:var(--primary); color:#fff; border-color:var(--primary); cursor:pointer; }
-        .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:12px; }
-        .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px; }
+        .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:8px; }
+        .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px; display:flex; flex-direction:column; gap:6px; height:100%; min-height:96px; }
         .kpi { grid-column:span 3; }
         .kpi .label { color:var(--muted); font-size:12px; }
-        .kpi .value { margin-top:6px; font-size:24px; font-weight:700; }
+        .kpi .value { margin-top:4px; font-size:21px; font-weight:700; }
         .pos{ color:var(--pos);} .neg{ color:var(--neg);} .muted{ color:var(--muted);}
         .wide{ grid-column:span 8;} .narrow{ grid-column:span 4;} .full{ grid-column:span 12; }
-        .panel-title { font-weight:600; margin-bottom:6px; }
-        .small { font-size:12px; color:var(--muted); }
+        .panel-title { font-weight:600; margin-bottom:2px; line-height:1.25; }
+        .small { font-size:12px; color:var(--muted); line-height:1.4; }
         table { width:100%; border-collapse:collapse; font-size:13px; }
         th,td { padding:8px; border-bottom:1px solid var(--line); text-align:right; }
         th:first-child,td:first-child { text-align:left; }
-        .trade-controls { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-top:8px; }
-        @media (max-width: 1100px){ .kpi,.wide,.narrow,.full{ grid-column:span 12; } .trade-controls{ grid-template-columns:repeat(2,1fr);} }
+        .toolbar input,.toolbar select,.toolbar button { width:100%; min-height:34px; }
+        .news-list { margin:0; padding-left:16px; display:grid; gap:6px; }
+        .news-list li { color:var(--text); line-height:1.35; }
+        .readme-list { margin:0; padding-left:18px; display:grid; gap:6px; }
+        .readme-list code { background:#f1f5fb; padding:1px 5px; border-radius:6px; }
+        @media (max-width: 1100px){
+            .kpi,.wide,.narrow,.full{ grid-column:span 12; }
+            .toolbar{ width:100%; }
+        }
+        @media (max-width: 700px){
+            .wrap { padding:10px; }
+            .title { font-size:22px; }
+            .subtitle { font-size:13px; }
+            .kpi .value { font-size:18px; }
+            input,select,button { padding:7px 8px; font-size:12px; }
+        }
     </style>
 </head>
 <body>
@@ -264,10 +423,10 @@ def dashboard() -> str:
         <div class=\"header\">
             <div>
                 <h1 class=\"title\">TradeEnv Professional NIFTY-50 Dashboard</h1>
-                <div class=\"subtitle\">Live market data + paper trading + agent tooling in one workspace.</div>
+                <div class=\"subtitle\">Live market data + OpenEnv controls in one compact workspace.</div>
                 <div style=\"margin-top:8px\">
                     <span class=\"badge\">Depth metrics are simulated in environment (not exchange L2 feed)</span>
-                    <span class=\"badge\">Demo portfolio and paper trades are virtual (non-real money)</span>
+                    <span class=\"badge\">Sentiment snippets are advisory and may be delayed</span>
                 </div>
             </div>
             <div class=\"toolbar\">
@@ -280,33 +439,31 @@ def dashboard() -> str:
         </div>
 
         <div class=\"grid\">
-            <div class=\"card kpi\"><div class=\"label\">Paper Portfolio Value</div><div id=\"kpiValue\" class=\"value\">-</div></div>
-            <div class=\"card kpi\"><div class=\"label\">Unrealized P&L</div><div id=\"kpiPnl\" class=\"value\">-</div></div>
+            <div class=\"card kpi\"><div class=\"label\">Selected Ticker</div><div id=\"kpiSymbol\" class=\"value\">-</div></div>
+            <div class=\"card kpi\"><div class=\"label\">Last Price</div><div id=\"kpiPrice\" class=\"value\">-</div></div>
             <div class=\"card kpi\"><div class=\"label\">Market Breadth (A/D)</div><div id=\"kpiBreadth\" class=\"value\">-</div></div>
-            <div class=\"card kpi\"><div class=\"label\">Fundamental Quality</div><div id=\"kpiFq\" class=\"value\">-</div></div>
+            <div class=\"card kpi\"><div class=\"label\">Sentiment Score</div><div id=\"kpiSent\" class=\"value\">-</div></div>
 
-            <div class=\"card wide\"><div class=\"panel-title\">Candlestick + SMA (Real Yahoo daily candles)</div><div id=\"priceChart\" style=\"height:360px\"></div></div>
-            <div class=\"card narrow\"><div class=\"panel-title\">Portfolio Allocation (Paper)</div><div id=\"pieChart\" style=\"height:360px\"></div></div>
+            <div class=\"card full\"><div class=\"panel-title\">Candlestick + SMA (Real Yahoo daily candles)</div><div id=\"priceChart\" style=\"height:320px\"></div></div>
 
             <div class=\"card wide\"><div class=\"panel-title\">Top Movers</div><div id=\"heatChart\" style=\"height:300px\"></div></div>
             <div class=\"card narrow\"><div class=\"panel-title\">Depth Proxy (Simulated)</div><div id=\"depthChart\" style=\"height:300px\"></div></div>
 
             <div class=\"card full\">
-                <div class=\"panel-title\">Human Agent Paper Trading Desk</div>
-                <div class=\"small\">Execute BUY/SELL paper trades on selected ticker and observe live P&L updates.</div>
-                <div class=\"trade-controls\">
-                    <select id=\"tradeSide\"><option value=\"buy\">BUY</option><option value=\"sell\">SELL</option></select>
-                    <input id=\"tradeQty\" type=\"number\" min=\"1\" step=\"1\" value=\"10\" />
-                    <button onclick=\"submitTrade()\">Execute Paper Trade</button>
-                    <button onclick=\"suggestTrade()\" style=\"background:#405f9b\">Agent Suggestion</button>
-                    <button onclick=\"resetPaper()\" style=\"background:#a86b00\">Reset Paper Account</button>
-                    <div id=\"tradeMsg\" class=\"small\" style=\"align-self:center\"></div>
-                </div>
+                <div class=\"panel-title\">Sentiment News Snippets</div>
+                <div class=\"small\" id=\"newsMeta\">Loading headlines…</div>
+                <ul class=\"news-list\" id=\"newsList\"></ul>
             </div>
 
             <div class=\"card full\">
-                <div class=\"panel-title\">Agent Endpoints & Specs</div>
-                <div class=\"small\" id=\"agentSpecs\"></div>
+                <div class=\"panel-title\">Agent Interactions README</div>
+                <div class=\"small\">How to use agent APIs programmatically from this dashboard backend.</div>
+                <ul class=\"readme-list\">
+                    <li><b>Discover contract:</b> call <code>GET /api/agent/specs</code> for endpoint and strategy metadata.</li>
+                    <li><b>Get suggestion:</b> call <code>POST /api/agent/suggest</code> with payload <code>{\"symbol\": \"RELIANCE.NS\"}</code>.</li>
+                    <li><b>Use market context:</b> combine <code>/api/market/overview</code>, <code>/api/market/history/{symbol}</code>, and <code>/api/market/depth/{symbol}</code>.</li>
+                    <li><b>Execution loop:</b> map agent output to your own executor or environment runner (no UI-side trade execution required).</li>
+                </ul>
             </div>
 
             <div class=\"card full\">
@@ -314,10 +471,6 @@ def dashboard() -> str:
                 <table id=\"watchTable\"><thead><tr><th>Symbol</th><th>Price</th><th>Δ</th><th>Δ%</th><th>Volume</th></tr></thead><tbody></tbody></table>
             </div>
 
-            <div class=\"card full\">
-                <div class=\"panel-title\">Paper Trade Blotter</div>
-                <table id=\"blotterTable\"><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Notional</th></tr></thead><tbody></tbody></table>
-            </div>
         </div>
     </div>
 
@@ -333,6 +486,13 @@ def dashboard() -> str:
             sel.innerHTML = data.symbols.map(s=>`<option value=\"${s.symbol}\">${s.symbol}</option>`).join('');
             if(cur && data.symbols.some(x=>x.symbol===cur)) sel.value = cur;
             document.getElementById('kpiBreadth').textContent = `${data.advancers} / ${data.decliners}`;
+
+            const activeSym = sel.value || 'RELIANCE.NS';
+            const activeRow = data.symbols.find(x => x.symbol === activeSym);
+            document.getElementById('kpiSymbol').textContent = activeSym.replace('.NS','');
+            const priceEl = document.getElementById('kpiPrice');
+            priceEl.textContent = activeRow ? `₹ ${fmt(activeRow.price)}` : '-';
+            priceEl.className = 'value ' + ((activeRow?.change_pct || 0) >= 0 ? 'pos' : 'neg');
 
             const body = document.querySelector('#watchTable tbody');
             body.innerHTML = data.symbols.slice(0,20).map(s=>`<tr>
@@ -360,66 +520,37 @@ def dashboard() -> str:
         }
 
         async function loadSignals(symbol){
-            const snap = await fetchJSON('/dashboard-snapshot');
-            document.getElementById('kpiFq').textContent = (snap.fundamentals?.fundamental_quality_score ?? 0).toFixed(3);
             const d = await fetchJSON(`/api/market/depth/${symbol}`);
             Plotly.newPlot('depthChart', [{type:'bar', x:['BidDepth','AskDepth','Spread(bps)'], y:[d.bid_depth_top,d.ask_depth_top,d.spread_bps], marker:{color:['#1b9e63','#d6455d','#2f66d0']}}], {
                 margin:{t:36,l:40,r:10,b:40}, paper_bgcolor:'#fff', plot_bgcolor:'#fff', xaxis:axisStyle(), yaxis:axisStyle()
             }, {displayModeBar:false});
         }
 
-        async function loadPaper(){
-            const p = await fetchJSON('/api/paper/state');
-            document.getElementById('kpiValue').textContent = `₹ ${fmt(p.portfolio_value)}`;
-            const pnlEl = document.getElementById('kpiPnl');
-            pnlEl.textContent = `₹ ${fmt(p.unrealized_pnl)}`;
-            pnlEl.className = 'value ' + (p.unrealized_pnl>=0?'pos':'neg');
-            Plotly.newPlot('pieChart', [{type:'pie', labels:p.weights.map(w=>w.symbol.replace('.NS','')), values:p.weights.map(w=>w.weight), hole:0.45}], {
-                margin:{t:34,l:10,r:10,b:10}, paper_bgcolor:'#fff', font:{color:'#1f2a44'}
-            }, {displayModeBar:false});
-            const tbody = document.querySelector('#blotterTable tbody');
-            tbody.innerHTML = p.trades.slice(-20).reverse().map(t=>`<tr><td>${t.ts}</td><td>${t.symbol}</td><td class=\"${t.side==='buy'?'pos':'neg'}\">${t.side.toUpperCase()}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td>${fmt(t.notional)}</td></tr>`).join('');
-        }
+        async function loadNewsSnippets(){
+            const snap = await fetchJSON('/dashboard-snapshot');
+            const s = snap.sentiment || {};
+            const headlines = Array.isArray(s.headlines) ? s.headlines : [];
+            const source = s.source || 'neutral_fallback';
+            const score = Number(s.score || 0);
+            const conf = Number(s.confidence || 0);
+            document.getElementById('newsMeta').textContent = `source=${source} | score=${score.toFixed(3)} | confidence=${conf.toFixed(3)}`;
+            const sentEl = document.getElementById('kpiSent');
+            sentEl.textContent = score.toFixed(3);
+            sentEl.className = 'value ' + (score >= 0 ? 'pos' : 'neg');
 
-        async function submitTrade(){
-            const symbol = document.getElementById('symbol').value || 'RELIANCE.NS';
-            const side = document.getElementById('tradeSide').value;
-            const qty = Number(document.getElementById('tradeQty').value || 0);
-            const msg = document.getElementById('tradeMsg');
-            try{
-                const out = await fetchJSON('/api/paper/trade', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({symbol, side, qty})});
-                msg.textContent = `Executed ${out.trade.side.toUpperCase()} ${out.trade.qty} ${out.trade.symbol} @ ${fmt(out.trade.price)}`;
-                await loadPaper();
-            }catch(e){ msg.textContent = 'Trade failed: '+e.message; }
-        }
-
-        async function resetPaper(){
-            await fetchJSON('/api/paper/reset', {method:'POST'});
-            document.getElementById('tradeMsg').textContent = 'Paper account reset.';
-            await loadPaper();
-        }
-
-        async function loadAgentSpecs(){
-            const s = await fetchJSON('/api/agent/specs');
-            document.getElementById('agentSpecs').innerHTML =
-                `<div><b>Endpoints:</b> ${s.endpoints.join(' • ')}</div>`+
-                `<div style=\"margin-top:4px\"><b>Supported strategies:</b> ${s.strategies.join(', ')}</div>`+
-                `<div style=\"margin-top:4px\"><b>Contract:</b> ${s.contract}</div>`;
-        }
-
-        async function suggestTrade(){
-            const symbol = document.getElementById('symbol').value || 'RELIANCE.NS';
-            const s = await fetchJSON('/api/agent/suggest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({symbol})});
-            document.getElementById('tradeSide').value = s.action.side;
-            document.getElementById('tradeQty').value = s.action.qty;
-            document.getElementById('tradeMsg').textContent = `Agent suggests ${s.action.side.toUpperCase()} ${s.action.qty} (${s.reason})`;
+            const list = document.getElementById('newsList');
+            if(!headlines.length){
+                list.innerHTML = '<li>No recent headlines available from sentiment feeds.</li>';
+                return;
+            }
+            list.innerHTML = headlines.slice(0,6).map(h => `<li>${h}</li>`).join('');
         }
 
         async function refreshAll(){
             const days = Number(document.getElementById('days').value || 45);
             await loadOverview(days);
             const symbol = document.getElementById('symbol').value || 'RELIANCE.NS';
-            await Promise.all([loadHistory(symbol, days), loadSignals(symbol), loadPaper(), loadAgentSpecs()]);
+            await Promise.all([loadHistory(symbol, days), loadSignals(symbol), loadNewsSnippets()]);
         }
 
         document.getElementById('symbol').addEventListener('change', refreshAll);
@@ -476,6 +607,11 @@ def api_market_history(symbol: str, days: int = Query(default=30, ge=5, le=180))
     }
 
 
+@app.get("/api/market/fundamentals/{symbol}")
+def api_market_fundamentals(symbol: str) -> dict:
+    return _get_symbol_fundamentals(symbol)
+
+
 @app.get("/api/portfolio/demo")
 def api_portfolio_demo(days: int = Query(default=30, ge=5, le=180)) -> dict:
     snap = _get_market_snapshot(days)
@@ -499,6 +635,67 @@ def api_market_depth(symbol: str) -> dict:
         "bid_depth_top": obs.bid_depth_top,
         "ask_depth_top": obs.ask_depth_top,
         "depth_imbalance": obs.depth_imbalance,
+    }
+
+
+@app.post("/api/human/session/new")
+def api_human_session_new() -> dict:
+    session_id, env = _get_or_create_human_env()
+    obs = env.reset()
+    return {
+        "session_id": session_id,
+        "observation": _serialize_observation(obs),
+        "reward": float(obs.reward or 0.0),
+        "done": bool(obs.done),
+    }
+
+
+@app.post("/api/human/reset")
+def api_human_reset(payload: dict = Body(...)) -> dict:
+    session_id = str(payload.get("session_id", "")).strip()
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    if not session_id:
+        raise ValueError("session_id is required")
+    _, env = _get_or_create_human_env(session_id)
+    obs = _reset_human_env_to_symbol(env, symbol)
+    return {
+        "session_id": session_id,
+        "observation": _serialize_observation(obs),
+        "reward": float(obs.reward or 0.0),
+        "done": bool(obs.done),
+    }
+
+
+@app.post("/api/human/step")
+def api_human_step(payload: dict = Body(...)) -> dict:
+    session_id = str(payload.get("session_id", "")).strip()
+    if not session_id:
+        raise ValueError("session_id is required")
+    _, env = _get_or_create_human_env(session_id)
+    action = TradeEnvAction(
+        action_type=str(payload.get("action_type", "hold")),
+        quantity=int(payload.get("quantity", 0)),
+        urgency=float(payload.get("urgency", 0.5)),
+    )
+    obs = env.step(action)
+    return {
+        "session_id": session_id,
+        "observation": _serialize_observation(obs),
+        "reward": float(obs.reward or 0.0),
+        "done": bool(obs.done),
+    }
+
+
+@app.get("/api/human/state")
+def api_human_state(session_id: str = Query(...)) -> dict:
+    sid = session_id.strip()
+    if not sid:
+        raise ValueError("session_id is required")
+    _, env = _get_or_create_human_env(sid)
+    return {
+        "session_id": sid,
+        "episode_id": env.state.episode_id,
+        "step_count": env.state.step_count,
     }
 
 
@@ -721,6 +918,7 @@ def dashboard_snapshot() -> dict:
             "score": obs.news_sentiment_score,
             "confidence": obs.news_sentiment_confidence,
             "source": (sentiment_meta or {}).get("source", (info.get("news_sentiment") or {}).get("source", "neutral_fallback")),
+            "headlines": (sentiment_meta or {}).get("headlines", (info.get("news_sentiment") or {}).get("headlines", [])),
         },
     }
 
