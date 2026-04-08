@@ -61,6 +61,7 @@ from functools import lru_cache
 
 import yfinance as yf
 from fastapi import Query
+from fastapi.responses import RedirectResponse
 from fastapi.responses import HTMLResponse
 
 
@@ -191,6 +192,12 @@ def _build_demo_portfolio(snapshot: dict) -> dict:
 def healthz() -> dict:
     """Simple readiness endpoint for HF Spaces and container probes."""
     return {"status": "ok", "env": "TradeEnv"}
+
+
+@app.get("/")
+def root_redirect() -> RedirectResponse:
+    """Ensure root always lands on the custom dashboard UI."""
+    return RedirectResponse(url="/dashboard", status_code=307)
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
