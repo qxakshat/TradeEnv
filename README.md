@@ -256,6 +256,19 @@ curl http://127.0.0.1:8000/dashboard-snapshot
 curl http://127.0.0.1:8000/api/market/overview?days=30
 curl http://127.0.0.1:8000/api/market/history/RELIANCE.NS?days=30
 curl http://127.0.0.1:8000/api/portfolio/demo
+
+# Agent + paper trading APIs
+curl http://127.0.0.1:8000/api/agent/specs
+curl -X POST http://127.0.0.1:8000/api/agent/suggest -H "Content-Type: application/json" -d '{"symbol":"RELIANCE.NS"}'
+curl http://127.0.0.1:8000/api/paper/state
+curl -X POST http://127.0.0.1:8000/api/paper/trade -H "Content-Type: application/json" -d '{"symbol":"RELIANCE.NS","side":"buy","qty":10}'
+curl -X POST http://127.0.0.1:8000/api/paper/reset
+
+### Data realism disclaimer in dashboard
+
+- Real market OHLC/quotes in dashboard come from Yahoo Finance (`yfinance`) snapshots.
+- Environment depth metrics and execution microstructure blocks are **simulated proxies**.
+- Paper trades are virtual and **not connected to broker/exchange execution**.
 ```
 
 ## Validate OpenEnv spec

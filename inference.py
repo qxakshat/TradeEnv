@@ -18,7 +18,7 @@ from server.tradeenv_environment import TradeEnvEnvironment
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+API_KEY = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 POLICY_MODE = os.getenv("POLICY_MODE", "heuristic")  # heuristic | openai
 BENCHMARK = "TradeEnv"
 MAX_STEPS = 16
@@ -166,6 +166,27 @@ def _unwrap_step_result(result):
     return obs, bool(getattr(obs, "done", False)), float(getattr(obs, "reward", 0.0) or 0.0)
 
 
+def startup_llm_probe(client: OpenAI | None) -> None:
+    """Best-effort startup LLM call for submission checks; never hard-fails."""
+    if client is None:
+        print("[LLM-PROBE] skipped: no API client configured", flush=True)
+        return
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a terse validation assistant."},
+                {"role": "user", "content": "Reply with OK"},
+            ],
+            temperature=0.0,
+            max_tokens=8,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        print(f"[LLM-PROBE] success: {out[:40]}", flush=True)
+    except Exception as exc:
+        print(f"[LLM-PROBE] failed (continuing): {exc}", flush=True)
+
+
 def run_episode(env, client: Optional[OpenAI]) -> Dict:
     result = env.reset()
     obs, done, _ = _unwrap_step_result(result)
@@ -218,10 +239,20 @@ def run_episode(env, client: Optional[OpenAI]) -> Dict:
 
 def main() -> None:
     client: OpenAI | None = None
-    if POLICY_MODE == "openai":
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY is required when POLICY_MODE=openai.")
-        client = OpenAI(base_url=API_BASE_URL, api_key=OPENAI_API_KEY)
+    # Submission environments inject API_BASE_URL and API_KEY. Use them if present.
+    try:
+        injected_base_url = os.environ["API_BASE_URL"]
+        injected_api_key = os.environ["API_KEY"]
+        client = OpenAI(base_url=injected_base_url, api_key=injected_api_key)
+    except KeyError:
+        if API_KEY:
+            client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+    if POLICY_MODE == "openai" and client is None:
+        raise RuntimeError("POLICY_MODE=openai requires API_BASE_URL/API_KEY (or OPENAI_API_KEY).")
+
+    # Required by submission feedback: do an LLM call at startup in try/except.
+    startup_llm_probe(client)
 
     # Deterministic offline baseline by default: no container/network dependency.
     env = TradeEnvEnvironment()

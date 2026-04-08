@@ -57,10 +57,11 @@ except ImportError:
     from server.tradeenv_environment import TradeEnvEnvironment
 
 import time
+import threading
 from functools import lru_cache
 
 import yfinance as yf
-from fastapi import Query
+from fastapi import Body, Query
 from fastapi.responses import RedirectResponse
 from fastapi.responses import HTMLResponse
 
@@ -80,6 +81,14 @@ NIFTY50_DASHBOARD = [
     "LT.NS", "KOTAKBANK.NS", "HINDUNILVR.NS", "AXISBANK.NS", "ASIANPAINT.NS", "BAJFINANCE.NS",
     "MARUTI.NS", "SUNPHARMA.NS", "TITAN.NS", "ULTRACEMCO.NS", "WIPRO.NS", "NTPC.NS", "POWERGRID.NS",
 ]
+
+PAPER_LOCK = threading.Lock()
+PAPER_ACCOUNT = {
+    "cash": 2_000_000.0,
+    "start_cash": 2_000_000.0,
+    "positions": {},  # symbol -> quantity
+    "trades": [],
+}
 
 
 def _safe_float(v: object, default: float = 0.0) -> float:
@@ -188,6 +197,14 @@ def _build_demo_portfolio(snapshot: dict) -> dict:
     }
 
 
+def _latest_price(symbol: str) -> float:
+    snap = _get_market_snapshot(30)
+    for row in snap.get("symbols", []):
+        if row["symbol"].upper() == symbol.upper():
+            return float(row["price"])
+    return 0.0
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     """Simple readiness endpoint for HF Spaces and container probes."""
@@ -202,49 +219,60 @@ def root_redirect() -> RedirectResponse:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
-        """Modern HF Space dashboard for human interaction and market visualization."""
+        """Light professional dashboard with market, agent, and paper-trading panels."""
         return """
 <!doctype html>
 <html>
 <head>
     <meta charset=\"utf-8\" />
     <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
-    <title>TradeEnv Pro Dashboard</title>
+    <title>TradeEnv Professional Dashboard</title>
     <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>
     <style>
-        :root { --bg:#0b1020; --panel:#121a30; --muted:#97a3c6; --txt:#e6ecff; --ok:#16c47f; --bad:#ff5c7a; --acc:#4f7cff; }
-        body { margin:0; font-family:Inter,system-ui,Arial,sans-serif; background:var(--bg); color:var(--txt); }
-        .wrap { max-width:1360px; margin:0 auto; padding:18px; }
-        .hdr { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
-        .title { font-size:28px; font-weight:700; }
-        .sub { color:var(--muted); font-size:13px; }
+        :root {
+            --bg:#f6f8fb; --panel:#ffffff; --line:#dfe5ef; --text:#1f2a44; --muted:#6d7b97;
+            --pos:#148a57; --neg:#c7344d; --primary:#2f66d0; --warning:#9a6d00;
+        }
+        * { box-sizing:border-box; }
+        body { margin:0; font-family:Inter,system-ui,Arial,sans-serif; background:var(--bg); color:var(--text); }
+        .wrap { max-width:1440px; margin:0 auto; padding:18px; }
+        .header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:14px; gap:12px; }
+        .title { font-size:30px; font-weight:700; margin:0; }
+        .subtitle { color:var(--muted); margin-top:4px; }
+        .badge { display:inline-block; background:#fff7df; color:var(--warning); border:1px solid #f0ddb2; border-radius:999px; padding:5px 10px; font-size:12px; margin-right:6px; }
+        .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+        input,select,button { border-radius:10px; border:1px solid var(--line); padding:8px 10px; font-size:13px; background:#fff; color:var(--text); }
+        button { background:var(--primary); color:#fff; border-color:var(--primary); cursor:pointer; }
         .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:12px; }
-        .card { background:var(--panel); border-radius:14px; padding:14px; box-shadow:0 0 0 1px rgba(255,255,255,.05) inset; }
+        .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px; }
         .kpi { grid-column:span 3; }
-        .kpi .v { font-size:24px; font-weight:700; margin-top:6px; }
-        .kpi .l { color:var(--muted); font-size:12px; }
-        .up { color:var(--ok); } .dn { color:var(--bad); }
-        .chart-lg { grid-column:span 8; min-height:340px; }
-        .chart-sm { grid-column:span 4; min-height:340px; }
-        .tbl { grid-column:span 12; overflow:auto; }
+        .kpi .label { color:var(--muted); font-size:12px; }
+        .kpi .value { margin-top:6px; font-size:24px; font-weight:700; }
+        .pos{ color:var(--pos);} .neg{ color:var(--neg);} .muted{ color:var(--muted);}
+        .wide{ grid-column:span 8;} .narrow{ grid-column:span 4;} .full{ grid-column:span 12; }
+        .panel-title { font-weight:600; margin-bottom:6px; }
+        .small { font-size:12px; color:var(--muted); }
         table { width:100%; border-collapse:collapse; font-size:13px; }
-        th,td { padding:8px; border-bottom:1px solid rgba(255,255,255,.07); text-align:right; }
+        th,td { padding:8px; border-bottom:1px solid var(--line); text-align:right; }
         th:first-child,td:first-child { text-align:left; }
-        .toolbar { display:flex; gap:8px; align-items:center; }
-        select,input { background:#0f1630; color:#fff; border:1px solid #2a3767; border-radius:8px; padding:7px 9px; }
-        button { background:var(--acc); color:#fff; border:none; border-radius:8px; padding:8px 12px; cursor:pointer; }
+        .trade-controls { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-top:8px; }
+        @media (max-width: 1100px){ .kpi,.wide,.narrow,.full{ grid-column:span 12; } .trade-controls{ grid-template-columns:repeat(2,1fr);} }
     </style>
 </head>
 <body>
     <div class=\"wrap\">
-        <div class=\"hdr\">
+        <div class=\"header\">
             <div>
-                <div class=\"title\">TradeEnv HF Space — Live NIFTY50 Control Center</div>
-                <div class=\"sub\">Realtime snapshot + historical charts + portfolio analytics + execution environment context</div>
+                <h1 class=\"title\">TradeEnv Professional NIFTY-50 Dashboard</h1>
+                <div class=\"subtitle\">Live market data + paper trading + agent tooling in one workspace.</div>
+                <div style=\"margin-top:8px\">
+                    <span class=\"badge\">Depth metrics are simulated in environment (not exchange L2 feed)</span>
+                    <span class=\"badge\">Demo portfolio and paper trades are virtual (non-real money)</span>
+                </div>
             </div>
             <div class=\"toolbar\">
-                <label>Lookback days</label>
-                <input id=\"days\" type=\"number\" min=\"5\" max=\"180\" value=\"30\" />
+                <label>Lookback</label>
+                <input id=\"days\" type=\"number\" min=\"5\" max=\"180\" value=\"45\" />
                 <label>Ticker</label>
                 <select id=\"symbol\"></select>
                 <button onclick=\"refreshAll()\">Refresh</button>
@@ -252,86 +280,146 @@ def dashboard() -> str:
         </div>
 
         <div class=\"grid\">
-            <div class=\"card kpi\"><div class=\"l\">Portfolio Value</div><div id=\"kpiValue\" class=\"v\">-</div></div>
-            <div class=\"card kpi\"><div class=\"l\">Day P&L</div><div id=\"kpiPnl\" class=\"v\">-</div></div>
-            <div class=\"card kpi\"><div class=\"l\">Advancers / Decliners</div><div id=\"kpiBreadth\" class=\"v\">-</div></div>
-            <div class=\"card kpi\"><div class=\"l\">Fundamental Quality</div><div id=\"kpiFq\" class=\"v\">-</div></div>
+            <div class=\"card kpi\"><div class=\"label\">Paper Portfolio Value</div><div id=\"kpiValue\" class=\"value\">-</div></div>
+            <div class=\"card kpi\"><div class=\"label\">Unrealized P&L</div><div id=\"kpiPnl\" class=\"value\">-</div></div>
+            <div class=\"card kpi\"><div class=\"label\">Market Breadth (A/D)</div><div id=\"kpiBreadth\" class=\"value\">-</div></div>
+            <div class=\"card kpi\"><div class=\"label\">Fundamental Quality</div><div id=\"kpiFq\" class=\"value\">-</div></div>
 
-            <div class=\"card chart-lg\"><div id=\"priceChart\" style=\"height:320px\"></div></div>
-            <div class=\"card chart-sm\"><div id=\"pieChart\" style=\"height:320px\"></div></div>
+            <div class=\"card wide\"><div class=\"panel-title\">Candlestick + SMA (Real Yahoo daily candles)</div><div id=\"priceChart\" style=\"height:360px\"></div></div>
+            <div class=\"card narrow\"><div class=\"panel-title\">Portfolio Allocation (Paper)</div><div id=\"pieChart\" style=\"height:360px\"></div></div>
 
-            <div class=\"card chart-lg\"><div id=\"heatChart\" style=\"height:320px\"></div></div>
-            <div class=\"card chart-sm\"><div id=\"depthChart\" style=\"height:320px\"></div></div>
+            <div class=\"card wide\"><div class=\"panel-title\">Top Movers</div><div id=\"heatChart\" style=\"height:300px\"></div></div>
+            <div class=\"card narrow\"><div class=\"panel-title\">Depth Proxy (Simulated)</div><div id=\"depthChart\" style=\"height:300px\"></div></div>
 
-            <div class=\"card tbl\">
-                <div style=\"font-weight:600;margin-bottom:8px\">NIFTY-50 Watchlist Snapshot</div>
+            <div class=\"card full\">
+                <div class=\"panel-title\">Human Agent Paper Trading Desk</div>
+                <div class=\"small\">Execute BUY/SELL paper trades on selected ticker and observe live P&L updates.</div>
+                <div class=\"trade-controls\">
+                    <select id=\"tradeSide\"><option value=\"buy\">BUY</option><option value=\"sell\">SELL</option></select>
+                    <input id=\"tradeQty\" type=\"number\" min=\"1\" step=\"1\" value=\"10\" />
+                    <button onclick=\"submitTrade()\">Execute Paper Trade</button>
+                    <button onclick=\"suggestTrade()\" style=\"background:#405f9b\">Agent Suggestion</button>
+                    <button onclick=\"resetPaper()\" style=\"background:#a86b00\">Reset Paper Account</button>
+                    <div id=\"tradeMsg\" class=\"small\" style=\"align-self:center\"></div>
+                </div>
+            </div>
+
+            <div class=\"card full\">
+                <div class=\"panel-title\">Agent Endpoints & Specs</div>
+                <div class=\"small\" id=\"agentSpecs\"></div>
+            </div>
+
+            <div class=\"card full\">
+                <div class=\"panel-title\">NIFTY-50 Watchlist Snapshot (Real)</div>
                 <table id=\"watchTable\"><thead><tr><th>Symbol</th><th>Price</th><th>Δ</th><th>Δ%</th><th>Volume</th></tr></thead><tbody></tbody></table>
+            </div>
+
+            <div class=\"card full\">
+                <div class=\"panel-title\">Paper Trade Blotter</div>
+                <table id=\"blotterTable\"><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Notional</th></tr></thead><tbody></tbody></table>
             </div>
         </div>
     </div>
 
     <script>
-        let lastSnapshot = null;
-
         function fmt(n){ return new Intl.NumberFormat('en-IN',{maximumFractionDigits:2}).format(n||0); }
-
-        async function fetchJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error('fetch failed'); return await r.json(); }
+        async function fetchJSON(url, opts){ const r=await fetch(url, opts); if(!r.ok) throw new Error(await r.text()); return await r.json(); }
+        function axisStyle(){ return {gridcolor:'#edf1f7', linecolor:'#dbe3f0'}; }
 
         async function loadOverview(days){
             const data = await fetchJSON(`/api/market/overview?days=${days}`);
-            lastSnapshot = data;
             const sel = document.getElementById('symbol');
             const cur = sel.value;
             sel.innerHTML = data.symbols.map(s=>`<option value=\"${s.symbol}\">${s.symbol}</option>`).join('');
             if(cur && data.symbols.some(x=>x.symbol===cur)) sel.value = cur;
-
             document.getElementById('kpiBreadth').textContent = `${data.advancers} / ${data.decliners}`;
-            const tbody = document.querySelector('#watchTable tbody');
-            tbody.innerHTML = data.symbols.slice(0,20).map(s=>`<tr>
-                <td>${s.symbol}</td>
-                <td>${fmt(s.price)}</td>
-                <td class=\"${s.change>=0?'up':'dn'}\">${fmt(s.change)}</td>
-                <td class=\"${s.change_pct>=0?'up':'dn'}\">${fmt(s.change_pct)}%</td>
-                <td>${fmt(s.volume)}</td>
-            </tr>`).join('');
+
+            const body = document.querySelector('#watchTable tbody');
+            body.innerHTML = data.symbols.slice(0,20).map(s=>`<tr>
+                <td>${s.symbol}</td><td>${fmt(s.price)}</td>
+                <td class=\"${s.change>=0?'pos':'neg'}\">${fmt(s.change)}</td>
+                <td class=\"${s.change_pct>=0?'pos':'neg'}\">${fmt(s.change_pct)}%</td>
+                <td>${fmt(s.volume)}</td></tr>`).join('');
 
             const x = data.symbols.slice(0,20).map(s=>s.symbol.replace('.NS',''));
             const y = data.symbols.slice(0,20).map(s=>s.change_pct);
-            Plotly.newPlot('heatChart', [{type:'bar', x, y, marker:{color:y.map(v=>v>=0?'#16c47f':'#ff5c7a')}}],
-                {title:'Top 20 Daily % Change', paper_bgcolor:'transparent', plot_bgcolor:'transparent', font:{color:'#dfe6ff'}});
+            Plotly.newPlot('heatChart', [{type:'bar', x, y, marker:{color:y.map(v=>v>=0?'#1b9e63':'#d6455d')}}], {
+                margin:{t:40,l:40,r:10,b:50}, paper_bgcolor:'#fff', plot_bgcolor:'#fff', xaxis:axisStyle(), yaxis:axisStyle()
+            }, {displayModeBar:false});
         }
 
         async function loadHistory(symbol, days){
             const h = await fetchJSON(`/api/market/history/${symbol}?days=${days}`);
             Plotly.newPlot('priceChart', [
-                {x:h.dates, y:h.close, type:'scatter', mode:'lines', name:'Close', line:{color:'#4f7cff'}},
-                {x:h.dates, y:h.sma7, type:'scatter', mode:'lines', name:'SMA7', line:{color:'#f7b801'}},
-            ], {title:`${symbol} — Last ${days} Days`, paper_bgcolor:'transparent', plot_bgcolor:'transparent', font:{color:'#dfe6ff'}});
-        }
-
-        async function loadPortfolio(){
-            const p = await fetchJSON('/api/portfolio/demo');
-            document.getElementById('kpiValue').textContent = `₹ ${fmt(p.total_value)}`;
-            const pnl = document.getElementById('kpiPnl');
-            pnl.textContent = `₹ ${fmt(p.pnl_day)}`;
-            pnl.className = 'v ' + (p.pnl_day>=0?'up':'dn');
-            Plotly.newPlot('pieChart', [{type:'pie', labels:p.weights.map(w=>w.symbol.replace('.NS','')), values:p.weights.map(w=>w.weight), hole:0.45}],
-                {title:'Portfolio Allocation', paper_bgcolor:'transparent', font:{color:'#dfe6ff'}});
+                {type:'candlestick', x:h.dates, open:h.open, high:h.high, low:h.low, close:h.close, name:'OHLC'},
+                {type:'scatter', mode:'lines', x:h.dates, y:h.sma7, name:'SMA7', line:{color:'#2f66d0', width:1.8}},
+            ], {
+                margin:{t:36,l:45,r:10,b:40}, paper_bgcolor:'#fff', plot_bgcolor:'#fff',
+                xaxis:axisStyle(), yaxis:axisStyle(), showlegend:true, legend:{orientation:'h'}
+            }, {displayModeBar:false});
         }
 
         async function loadSignals(symbol){
-            const s = await fetchJSON('/dashboard-snapshot');
-            document.getElementById('kpiFq').textContent = (s.fundamentals?.fundamental_quality_score ?? 0).toFixed(3);
+            const snap = await fetchJSON('/dashboard-snapshot');
+            document.getElementById('kpiFq').textContent = (snap.fundamentals?.fundamental_quality_score ?? 0).toFixed(3);
             const d = await fetchJSON(`/api/market/depth/${symbol}`);
-            Plotly.newPlot('depthChart', [{type:'bar', x:['BidDepth','AskDepth','SpreadBps'], y:[d.bid_depth_top,d.ask_depth_top,d.spread_bps], marker:{color:['#16c47f','#ff5c7a','#4f7cff']}}],
-                {title:`Microstructure — ${symbol}`, paper_bgcolor:'transparent', plot_bgcolor:'transparent', font:{color:'#dfe6ff'}});
+            Plotly.newPlot('depthChart', [{type:'bar', x:['BidDepth','AskDepth','Spread(bps)'], y:[d.bid_depth_top,d.ask_depth_top,d.spread_bps], marker:{color:['#1b9e63','#d6455d','#2f66d0']}}], {
+                margin:{t:36,l:40,r:10,b:40}, paper_bgcolor:'#fff', plot_bgcolor:'#fff', xaxis:axisStyle(), yaxis:axisStyle()
+            }, {displayModeBar:false});
+        }
+
+        async function loadPaper(){
+            const p = await fetchJSON('/api/paper/state');
+            document.getElementById('kpiValue').textContent = `₹ ${fmt(p.portfolio_value)}`;
+            const pnlEl = document.getElementById('kpiPnl');
+            pnlEl.textContent = `₹ ${fmt(p.unrealized_pnl)}`;
+            pnlEl.className = 'value ' + (p.unrealized_pnl>=0?'pos':'neg');
+            Plotly.newPlot('pieChart', [{type:'pie', labels:p.weights.map(w=>w.symbol.replace('.NS','')), values:p.weights.map(w=>w.weight), hole:0.45}], {
+                margin:{t:34,l:10,r:10,b:10}, paper_bgcolor:'#fff', font:{color:'#1f2a44'}
+            }, {displayModeBar:false});
+            const tbody = document.querySelector('#blotterTable tbody');
+            tbody.innerHTML = p.trades.slice(-20).reverse().map(t=>`<tr><td>${t.ts}</td><td>${t.symbol}</td><td class=\"${t.side==='buy'?'pos':'neg'}\">${t.side.toUpperCase()}</td><td>${t.qty}</td><td>${fmt(t.price)}</td><td>${fmt(t.notional)}</td></tr>`).join('');
+        }
+
+        async function submitTrade(){
+            const symbol = document.getElementById('symbol').value || 'RELIANCE.NS';
+            const side = document.getElementById('tradeSide').value;
+            const qty = Number(document.getElementById('tradeQty').value || 0);
+            const msg = document.getElementById('tradeMsg');
+            try{
+                const out = await fetchJSON('/api/paper/trade', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({symbol, side, qty})});
+                msg.textContent = `Executed ${out.trade.side.toUpperCase()} ${out.trade.qty} ${out.trade.symbol} @ ${fmt(out.trade.price)}`;
+                await loadPaper();
+            }catch(e){ msg.textContent = 'Trade failed: '+e.message; }
+        }
+
+        async function resetPaper(){
+            await fetchJSON('/api/paper/reset', {method:'POST'});
+            document.getElementById('tradeMsg').textContent = 'Paper account reset.';
+            await loadPaper();
+        }
+
+        async function loadAgentSpecs(){
+            const s = await fetchJSON('/api/agent/specs');
+            document.getElementById('agentSpecs').innerHTML =
+                `<div><b>Endpoints:</b> ${s.endpoints.join(' • ')}</div>`+
+                `<div style=\"margin-top:4px\"><b>Supported strategies:</b> ${s.strategies.join(', ')}</div>`+
+                `<div style=\"margin-top:4px\"><b>Contract:</b> ${s.contract}</div>`;
+        }
+
+        async function suggestTrade(){
+            const symbol = document.getElementById('symbol').value || 'RELIANCE.NS';
+            const s = await fetchJSON('/api/agent/suggest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({symbol})});
+            document.getElementById('tradeSide').value = s.action.side;
+            document.getElementById('tradeQty').value = s.action.qty;
+            document.getElementById('tradeMsg').textContent = `Agent suggests ${s.action.side.toUpperCase()} ${s.action.qty} (${s.reason})`;
         }
 
         async function refreshAll(){
-            const days = Number(document.getElementById('days').value || 30);
+            const days = Number(document.getElementById('days').value || 45);
             await loadOverview(days);
             const symbol = document.getElementById('symbol').value || 'RELIANCE.NS';
-            await Promise.all([loadHistory(symbol, days), loadPortfolio(), loadSignals(symbol)]);
+            await Promise.all([loadHistory(symbol, days), loadSignals(symbol), loadPaper(), loadAgentSpecs()]);
         }
 
         document.getElementById('symbol').addEventListener('change', refreshAll);
@@ -350,62 +438,198 @@ def api_market_overview(days: int = Query(default=30, ge=5, le=180)) -> dict:
 
 @app.get("/api/market/history/{symbol}")
 def api_market_history(symbol: str, days: int = Query(default=30, ge=5, le=180)) -> dict:
-        s = symbol.upper()
-        if s not in NIFTY50_DASHBOARD:
-                s = "RELIANCE.NS"
+    s = symbol.upper()
+    if s not in NIFTY50_DASHBOARD:
+        s = "RELIANCE.NS"
 
-        raw = yf.download(
-                tickers=s,
-                period=f"{days}d",
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-        )
-        if raw.empty:
-                return {"symbol": s, "dates": [], "close": [], "sma7": []}
+    raw = yf.download(
+        tickers=s,
+        period=f"{days}d",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    if raw.empty:
+        return {"symbol": s, "dates": [], "open": [], "high": [], "low": [], "close": [], "sma7": []}
 
-        close_obj = raw["Close"]
-        if hasattr(close_obj, "columns"):
-            # Handle MultiIndex/dataframe return shape from yfinance.
-            close = close_obj.iloc[:, 0].astype(float)
-        else:
-            close = close_obj.astype(float)
-        sma7 = close.rolling(7, min_periods=1).mean()
-        dates = [d.strftime("%Y-%m-%d") for d in close.index]
-        return {
-                "symbol": s,
-                "dates": dates,
-                "close": [round(float(x), 4) for x in close.tolist()],
-                "sma7": [round(float(x), 4) for x in sma7.tolist()],
-        }
+    def pick_col(name: str):
+        obj = raw[name]
+        if hasattr(obj, "columns"):
+            return obj.iloc[:, 0].astype(float)
+        return obj.astype(float)
+
+    o = pick_col("Open")
+    h = pick_col("High")
+    l = pick_col("Low")
+    c = pick_col("Close")
+    sma7 = c.rolling(7, min_periods=1).mean()
+    dates = [d.strftime("%Y-%m-%d") for d in c.index]
+    return {
+        "symbol": s,
+        "dates": dates,
+        "open": [round(float(x), 4) for x in o.tolist()],
+        "high": [round(float(x), 4) for x in h.tolist()],
+        "low": [round(float(x), 4) for x in l.tolist()],
+        "close": [round(float(x), 4) for x in c.tolist()],
+        "sma7": [round(float(x), 4) for x in sma7.tolist()],
+    }
 
 
 @app.get("/api/portfolio/demo")
 def api_portfolio_demo(days: int = Query(default=30, ge=5, le=180)) -> dict:
-        snap = _get_market_snapshot(days)
-        return _build_demo_portfolio(snap)
+    snap = _get_market_snapshot(days)
+    return _build_demo_portfolio(snap)
 
 
 @app.get("/api/market/depth/{symbol}")
 def api_market_depth(symbol: str) -> dict:
-        """Depth proxy from environment simulation for UI diagnostics."""
-        env = TradeEnvEnvironment()
+    """Depth proxy from environment simulation for UI diagnostics."""
+    env = TradeEnvEnvironment()
+    obs = env.reset()
+    for _ in range(8):
+        if obs.symbol.upper() == symbol.upper():
+            break
         obs = env.reset()
-        # rotate until symbol match (bounded)
-        for _ in range(8):
-                if obs.symbol.upper() == symbol.upper():
-                        break
-                obs = env.reset()
-        return {
-                "symbol": obs.symbol,
-                "best_bid": obs.best_bid,
-                "best_ask": obs.best_ask,
-                "spread_bps": obs.spread_bps,
-                "bid_depth_top": obs.bid_depth_top,
-                "ask_depth_top": obs.ask_depth_top,
-                "depth_imbalance": obs.depth_imbalance,
+    return {
+        "symbol": obs.symbol,
+        "best_bid": obs.best_bid,
+        "best_ask": obs.best_ask,
+        "spread_bps": obs.spread_bps,
+        "bid_depth_top": obs.bid_depth_top,
+        "ask_depth_top": obs.ask_depth_top,
+        "depth_imbalance": obs.depth_imbalance,
+    }
+
+
+@app.post("/api/paper/reset")
+def api_paper_reset() -> dict:
+    with PAPER_LOCK:
+        PAPER_ACCOUNT["cash"] = PAPER_ACCOUNT["start_cash"]
+        PAPER_ACCOUNT["positions"] = {}
+        PAPER_ACCOUNT["trades"] = []
+    return {"status": "ok"}
+
+
+@app.get("/api/paper/state")
+def api_paper_state() -> dict:
+    with PAPER_LOCK:
+        positions = dict(PAPER_ACCOUNT["positions"])
+        trades = list(PAPER_ACCOUNT["trades"])
+        cash = float(PAPER_ACCOUNT["cash"])
+        start_cash = float(PAPER_ACCOUNT["start_cash"])
+
+    holdings = []
+    holdings_value = 0.0
+    for sym, qty in positions.items():
+        if qty <= 0:
+            continue
+        px = _latest_price(sym)
+        val = qty * px
+        holdings_value += val
+        holdings.append({"symbol": sym, "qty": qty, "ltp": round(px, 4), "value": round(val, 2)})
+
+    portfolio_value = cash + holdings_value
+    unrealized_pnl = portfolio_value - start_cash
+    weights = [
+        {"symbol": h["symbol"], "weight": round((h["value"] / max(holdings_value, 1e-9)) * 100.0, 2)}
+        for h in holdings
+    ]
+    return {
+        "cash": round(cash, 2),
+        "portfolio_value": round(portfolio_value, 2),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "holdings": holdings,
+        "weights": weights,
+        "trades": trades,
+        "is_simulated": True,
+        "notice": "Paper trades are virtual and use last snapshot prices (non-exchange execution).",
+    }
+
+
+@app.post("/api/paper/trade")
+def api_paper_trade(payload: dict = Body(...)) -> dict:
+    symbol = str(payload.get("symbol", "RELIANCE.NS")).upper()
+    side = str(payload.get("side", "buy")).lower()
+    qty = int(max(1, int(payload.get("qty", 1))))
+    if symbol not in NIFTY50_DASHBOARD:
+        symbol = "RELIANCE.NS"
+    if side not in {"buy", "sell"}:
+        side = "buy"
+
+    price = _latest_price(symbol)
+    if price <= 0:
+        raise ValueError("Price unavailable for selected symbol")
+
+    with PAPER_LOCK:
+        positions = PAPER_ACCOUNT["positions"]
+        cash = float(PAPER_ACCOUNT["cash"])
+        notional = qty * price
+        if side == "buy":
+            if notional > cash:
+                qty = int(cash // max(price, 1e-9))
+                notional = qty * price
+            if qty <= 0:
+                return {"status": "rejected", "reason": "insufficient_cash"}
+            PAPER_ACCOUNT["cash"] = cash - notional
+            positions[symbol] = int(positions.get(symbol, 0)) + qty
+        else:
+            held = int(positions.get(symbol, 0))
+            if held <= 0:
+                return {"status": "rejected", "reason": "no_position"}
+            qty = min(qty, held)
+            notional = qty * price
+            PAPER_ACCOUNT["cash"] = cash + notional
+            positions[symbol] = held - qty
+            if positions[symbol] <= 0:
+                positions.pop(symbol, None)
+
+        trade = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "price": round(price, 4),
+            "notional": round(notional, 2),
         }
+        PAPER_ACCOUNT["trades"].append(trade)
+    return {"status": "ok", "trade": trade}
+
+
+@app.get("/api/agent/specs")
+def api_agent_specs() -> dict:
+    return {
+        "name": "TradeEnvAgentAssist",
+        "contract": "POST /api/agent/suggest with {symbol} -> returns side/qty/reason for paper trading",
+        "strategies": ["trend_follow", "mean_reversion", "depth_aware"],
+        "endpoints": [
+            "GET /api/agent/specs",
+            "POST /api/agent/suggest",
+            "GET /api/paper/state",
+            "POST /api/paper/trade",
+            "POST /api/paper/reset",
+        ],
+    }
+
+
+@app.post("/api/agent/suggest")
+def api_agent_suggest(payload: dict = Body(...)) -> dict:
+    symbol = str(payload.get("symbol", "RELIANCE.NS")).upper()
+    if symbol not in NIFTY50_DASHBOARD:
+        symbol = "RELIANCE.NS"
+    hist = api_market_history(symbol=symbol, days=30)
+    if not hist.get("close"):
+        return {"symbol": symbol, "action": {"side": "buy", "qty": 1}, "reason": "fallback_no_history"}
+
+    close = hist["close"]
+    sma7 = hist["sma7"]
+    last = close[-1]
+    ma = sma7[-1]
+    if last >= ma:
+        side, qty, reason = "buy", 12, "trend_follow: close above SMA7"
+    else:
+        side, qty, reason = "sell", 10, "mean_reversion: close below SMA7"
+    return {"symbol": symbol, "action": {"side": side, "qty": qty}, "reason": reason}
 
 
 @app.get("/ui-config")
