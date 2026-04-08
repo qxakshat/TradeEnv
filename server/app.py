@@ -365,7 +365,7 @@ def root_redirect() -> RedirectResponse:
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
     """Light professional dashboard with market intelligence panels."""
-        return """
+    return """
 <!doctype html>
 <html>
 <head>
