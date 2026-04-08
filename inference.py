@@ -127,6 +127,15 @@ def choose_action_with_model(client: OpenAI, obs) -> Tuple[str, int, str]:
         spread_bps={obs.spread_bps:.2f}
         depth_imbalance={obs.depth_imbalance:.4f}
         est_slippage_bps={obs.estimated_slippage_bps:.2f}
+        pe_ratio={obs.pe_ratio:.3f}
+        price_to_book={obs.price_to_book:.3f}
+        roe={obs.return_on_equity:.3f}
+        debt_to_equity={obs.debt_to_equity:.3f}
+        profit_margin={obs.profit_margin:.3f}
+        revenue_growth={obs.revenue_growth:.3f}
+        fundamental_quality={obs.fundamental_quality_score:.3f}
+        sentiment_score={obs.news_sentiment_score:.3f}
+        sentiment_confidence={obs.news_sentiment_confidence:.3f}
         """
     ).strip()
 

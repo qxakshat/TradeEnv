@@ -4,6 +4,7 @@ type: space
 runtime: fastapi
 app: server.app:app
 port: 8000
+base_path: /dashboard
 metadata:
   domain: financial-execution
   description: "Bulk stock execution benchmark with deterministic grading across easy/medium/hard tasks"

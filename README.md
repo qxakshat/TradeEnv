@@ -58,6 +58,8 @@ Includes:
 
 - task metadata: `task_name`, `difficulty`, `role`
 - market: `symbol`, `current_price`, `best_bid`, `best_ask`, `spread_bps`, `bid_depth_top`, `ask_depth_top`, `depth_imbalance`, `estimated_slippage_bps`, `ema_fast`, `ema_slow`, `rsi_14`
+- fundamentals: `pe_ratio`, `price_to_book`, `return_on_equity`, `debt_to_equity`, `profit_margin`, `revenue_growth`, `fundamental_quality_score`
+- news context: `news_sentiment_score`, `news_sentiment_confidence`
 - execution state: `target_side`, `target_quantity`, `remaining_quantity`, `executed_quantity`, `avg_execution_price`
 - constraints: `trades_used`, `max_trades_per_day`
 - OpenEnv fields: `reward`, `done`, `metadata`
@@ -172,9 +174,24 @@ To differentiate from `openenv-finrl`-style pure price/technical setups, TradeEn
 
 Design note: sentiment is **advisory** by default and does not break deterministic grading formulas.
 
+## Web Fundamentals Signal (Differentiator)
+
+TradeEnv now augments each episode with website-sourced fundamentals per symbol:
+
+- Yahoo key statistics page
+- Yahoo quoteSummary endpoint (`defaultKeyStatistics`, `financialData`, `summaryDetail`)
+- Moneycontrol site link in source attribution
+
+The environment caches a weekly `data/fundamentals_snapshot.csv` and exposes values + source URLs via:
+
+- observation fields (`pe_ratio`, `price_to_book`, `return_on_equity`, `debt_to_equity`, `profit_margin`, `revenue_growth`, `fundamental_quality_score`)
+- metadata (`metadata.info.fundamentals.sources`)
+- app endpoint `GET /dashboard-snapshot`
+
 ### How this differs from openenv-finrl
 
 - **Depth-aware execution microstructure** (spread/depth/imbalance/slippage state)
+- **Web fundamentals channel** (valuation + balance-sheet quality features from finance websites)
 - **Role-conditional grading** (5 trading roles with different reward pressure)
 - **Anti-randomness reward shaping** (micro-trade and flip-flop penalties)
 - **Variance-aware execution objective** (terminal variance penalty)
@@ -223,11 +240,22 @@ uv sync
 ```bash
 uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
 
+# New powerful dashboard UI (HF-style)
+open http://127.0.0.1:8000/dashboard
+
 # Optional custom UI metadata endpoint
 curl http://127.0.0.1:8000/ui-config
 
 # Optional frontend help page payload
 curl http://127.0.0.1:8000/frontend-readme
+
+# Optional dashboard sample with source-backed fundamentals values
+curl http://127.0.0.1:8000/dashboard-snapshot
+
+# Live market APIs used by dashboard
+curl http://127.0.0.1:8000/api/market/overview?days=30
+curl http://127.0.0.1:8000/api/market/history/RELIANCE.NS?days=30
+curl http://127.0.0.1:8000/api/portfolio/demo
 ```
 
 ## Validate OpenEnv spec
@@ -261,6 +289,8 @@ uv run python inference.py
 If the OpenAI API is unavailable, the script falls back to a deterministic safe policy so the benchmark still completes end-to-end.
 
 The notebook `notebooks/hackathon_project.ipynb` also contains a saved DL-policy vs random-baseline comparison for the hackathon submission workflow.
+
+It now includes fundamentals-augmented feature engineering (12-dim input with valuation/profitability/growth signals) so training reflects both microstructure and company quality.
 
 ## Project structure
 

@@ -21,10 +21,12 @@ try:
         TradingRole,
     )
     from .broker_adapters import get_supported_brokers
+    from .fundamentals import load_or_fetch_fundamentals
     from .news_sentiment import SentimentSnapshot, fetch_sentiment_snapshot
 except ImportError:
     from models import TradeEnvAction, TradeEnvObservation, TradeEnvReward, TradeEnvTaskScore, TradingRole
     from server.broker_adapters import get_supported_brokers
+    from server.fundamentals import load_or_fetch_fundamentals
     from server.news_sentiment import SentimentSnapshot, fetch_sentiment_snapshot
 
 
@@ -110,6 +112,8 @@ class TradeEnvEnvironment(Environment):
         self._role: RoleSpec = ROLES[0]
         self._market: pd.DataFrame | None = None
         self._episodes: pd.DataFrame | None = None
+        self._fundamentals: pd.DataFrame | None = None
+        self._fundamental_sources: Dict[str, List[str]] = {}
 
         self._price_path: List[float] = []
         self._book_path: List[Dict[str, float]] = []
@@ -144,6 +148,15 @@ class TradeEnvEnvironment(Environment):
         self._prev_action_type = "hold"
         self._prev_exec_qty = 0
         self._sentiment = SentimentSnapshot(score=0.0, confidence=0.0, headlines=[], source="neutral_fallback")
+        self._current_fundamentals: Dict[str, float] = {
+            "pe_ratio": 20.0,
+            "price_to_book": 3.0,
+            "return_on_equity": 0.12,
+            "debt_to_equity": 80.0,
+            "profit_margin": 0.08,
+            "revenue_growth": 0.10,
+            "fundamental_quality_score": 0.50,
+        }
 
     def reset(self) -> TradeEnvObservation:
         self._state = State(episode_id=str(uuid4()), step_count=0)
@@ -156,6 +169,15 @@ class TradeEnvEnvironment(Environment):
         if self._market is None:
             self._market = self._download_market_data(NIFTY50_SYMBOLS)
             self._episodes = self._build_episode_table(self._market)
+        if self._fundamentals is None:
+            import pathlib
+
+            snapshot = load_or_fetch_fundamentals(
+                NIFTY50_SYMBOLS,
+                cache_path=pathlib.Path(__file__).parent.parent / "data" / "fundamentals_snapshot.csv",
+            )
+            self._fundamentals = snapshot.table
+            self._fundamental_sources = snapshot.source_urls
 
         assert self._episodes is not None
         task_rows = self._episodes[self._episodes["symbol"].isin(self._task.symbols)].reset_index(drop=True)
@@ -170,6 +192,7 @@ class TradeEnvEnvironment(Environment):
         self._ema_fast = float(row["ema_fast"])
         self._ema_slow = float(row["ema_slow"])
         self._rsi = float(row["rsi_14"])
+        self._set_current_fundamentals(self._symbol)
 
         self._price_path = self._synthetic_intraday_path(
             open_price=float(row["open"]),
@@ -367,6 +390,11 @@ class TradeEnvEnvironment(Environment):
                 "source": self._sentiment.source,
                 "headlines": self._sentiment.headlines,
             },
+            "fundamentals": {
+                "symbol": self._symbol,
+                "values": self._current_fundamentals,
+                "sources": self._fundamental_sources.get(self._symbol, []),
+            },
         }
 
         obs = self._build_observation(done=done, reward=reward_obj.total, info=info)
@@ -392,6 +420,13 @@ class TradeEnvEnvironment(Environment):
             estimated_slippage_bps=float(self._last_slippage_bps),
             news_sentiment_score=float(self._sentiment.score),
             news_sentiment_confidence=float(self._sentiment.confidence),
+            pe_ratio=float(self._current_fundamentals["pe_ratio"]),
+            price_to_book=float(self._current_fundamentals["price_to_book"]),
+            return_on_equity=float(self._current_fundamentals["return_on_equity"]),
+            debt_to_equity=float(self._current_fundamentals["debt_to_equity"]),
+            profit_margin=float(self._current_fundamentals["profit_margin"]),
+            revenue_growth=float(self._current_fundamentals["revenue_growth"]),
+            fundamental_quality_score=float(self._current_fundamentals["fundamental_quality_score"]),
             ema_fast=self._ema_fast,
             ema_slow=self._ema_slow,
             rsi_14=self._rsi,
@@ -408,14 +443,42 @@ class TradeEnvEnvironment(Environment):
                 "task_description": self._task.description,
                 "role_description": self._role.description,
                 "date": self._date,
+                "fundamentals": {
+                    "symbol": self._symbol,
+                    "values": self._current_fundamentals,
+                    "sources": self._fundamental_sources.get(self._symbol, []),
+                },
+                "news_sentiment": {
+                    "score": self._sentiment.score,
+                    "confidence": self._sentiment.confidence,
+                    "source": self._sentiment.source,
+                    "headlines": self._sentiment.headlines,
+                },
                 "info": info,
                 "ui": {
                     "primary_metric": "task_score",
                     "secondary_metric": "estimated_slippage_bps",
-                    "charts": ["reward_breakdown", "depth_imbalance", "spread_bps"],
+                    "charts": ["reward_breakdown", "depth_imbalance", "spread_bps", "fundamental_quality"],
                 },
             },
         )
+
+    def _set_current_fundamentals(self, symbol: str) -> None:
+        if self._fundamentals is None or self._fundamentals.empty:
+            return
+        row = self._fundamentals[self._fundamentals["symbol"] == symbol]
+        if row.empty:
+            return
+        rr = row.iloc[0]
+        self._current_fundamentals = {
+            "pe_ratio": float(rr.get("pe_ratio", 20.0)),
+            "price_to_book": float(rr.get("price_to_book", 3.0)),
+            "return_on_equity": float(rr.get("return_on_equity", 0.12)),
+            "debt_to_equity": float(rr.get("debt_to_equity", 80.0)),
+            "profit_margin": float(rr.get("profit_margin", 0.08)),
+            "revenue_growth": float(rr.get("revenue_growth", 0.10)),
+            "fundamental_quality_score": float(rr.get("fundamental_quality_score", 0.50)),
+        }
 
     def _grade_current_task(self) -> TradeEnvTaskScore:
         if self._executed_qty <= 0:
