@@ -40,7 +40,7 @@ try:
     from .tradeenv_environment import TradeEnvEnvironment
 except ModuleNotFoundError:
     from models import TradeEnvAction, TradeEnvObservation
-    from environment.tradeenv_environment import TradeEnvEnvironment
+    from server.tradeenv_environment import TradeEnvEnvironment
 
 
 # Create the app with web interface and README integration

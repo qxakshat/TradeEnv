@@ -42,6 +42,7 @@ Manifest: `openenv.yaml`
 Validation:
 
 - `openenv validate`
+- Verified locally on 2026-04-08: `openenv validate` returned **Ready for multi-mode deployment**
 
 ## Observation and Action Space
 
@@ -134,7 +135,7 @@ openenv validate
 ## Build & run container
 
 ```bash
-docker build -t tradeenv:latest -f server/Dockerfile .
+docker build -t tradeenv:latest .
 docker run --rm -p 8000:8000 tradeenv:latest
 ```
 
@@ -150,8 +151,12 @@ The repo is Docker-first and tagged for OpenEnv Spaces (`tags: [openenv]`).
 
 ```bash
 export OPENAI_API_KEY=<your_key>
-python inference.py
+uv run python inference.py
 ```
+
+If the OpenAI API is unavailable, the script falls back to a deterministic safe policy so the benchmark still completes end-to-end.
+
+The notebook `notebooks/hackathon_project.ipynb` also contains a saved DL-policy vs random-baseline comparison for the hackathon submission workflow.
 
 ## Project structure
 
@@ -160,4 +165,5 @@ python inference.py
 - `client.py`: typed OpenEnv client
 - `inference.py`: OpenAI baseline over 3 tasks
 - `openenv.yaml`: environment manifest
-- `server/Dockerfile`: container image for local/HF deployment
+- `Dockerfile`: root container image for local/HF deployment
+- `server/Dockerfile`: mirrored build file kept for OpenEnv-oriented workflows
