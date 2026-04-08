@@ -1,0 +1,14 @@
+spec_version: 1
+name: bulkTrade
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+metadata:
+  domain: financial-execution
+  description: "Bulk stock execution benchmark with deterministic grading across easy/medium/hard tasks"
+  tags:
+    - openenv
+    - trading
+    - execution
+
