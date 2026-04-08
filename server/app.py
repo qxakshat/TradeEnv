@@ -38,7 +38,7 @@ except Exception as e:  # pragma: no cover
 try:
     from ..models import TradeEnvAction, TradeEnvObservation
     from .tradeenv_environment import TradeEnvEnvironment
-except ModuleNotFoundError:
+except ImportError:
     from models import TradeEnvAction, TradeEnvObservation
     from server.tradeenv_environment import TradeEnvEnvironment
 
